@@ -82,6 +82,17 @@ export class Service {
     await this.db.query(`INSERT INTO members (group_id,telegram_id,role,bot_id) VALUES ($1,$2,'member',$3)`, [group.id, telegramId,this.botId]);
   }
   admin(member: Member) { this.assertMember(member); if (member.role !== 'admin') throw new UserError('Это действие доступно администратору группы.'); }
+  async reminderSettings(admin: Member) {
+    this.admin(admin);
+    const group = (await this.db.query<{ reminder_hour: number; timezone: string }>('SELECT reminder_hour,timezone FROM task_groups WHERE id=$1 AND bot_id=$2',[admin.group_id,this.botId])).rows[0];
+    if (!group) throw new UserError('Группа не найдена у этого бота.');
+    return group;
+  }
+  async setReminderHour(admin: Member, hour: number) {
+    this.admin(admin);
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) throw new UserError('Выбери час от 00 до 23.');
+    await this.db.query('UPDATE task_groups SET reminder_hour=$1 WHERE id=$2 AND bot_id=$3',[hour,admin.group_id,this.botId]);
+  }
   async session(telegramId: string): Promise<Session | undefined> {
     return (await this.db.query<{ data: Session }>('SELECT data FROM sessions WHERE telegram_id=$1 AND expires_at>$2 AND bot_id=$3', [telegramId, this.now,this.botId])).rows[0]?.data;
   }
@@ -263,10 +274,16 @@ export class Service {
     return tasks.length ? `📋 Твои невыполненные задачи (${tasks.length}):\n${tasks.slice(0,15).map(t => `• ${t.title} — ${t.due_on}`).join('\n')}\n\nОткрыть список: /tasks` : undefined;
   }
   async reminders() {
-    const groups = (await this.db.query<{ id: number; timezone: string }>('SELECT id,timezone FROM task_groups WHERE bot_id=$1 ORDER BY id',[this.botId])).rows;
+    const groups = (await this.db.query<{ id: number; timezone: string; reminder_hour: number }>('SELECT id,timezone,reminder_hour FROM task_groups WHERE bot_id=$1 ORDER BY id',[this.botId])).rows;
     for (const group of groups) {
+      const day = localDay(this.now,group.timezone);
+      const hour = Number(new Intl.DateTimeFormat('en-GB',{ timeZone: group.timezone,hour: '2-digit',hourCycle: 'h23' }).format(this.now));
+      if (hour < group.reminder_hour) continue;
+      // Atomically claim today's group mailing; concurrent runs and time edits cannot duplicate it.
+      const claimed = await this.db.query(`UPDATE task_groups SET last_reminder_on=$1 WHERE id=$2 AND bot_id=$3
+        AND reminder_hour<=$4 AND (last_reminder_on IS NULL OR last_reminder_on<$1) RETURNING id`,[day,group.id,this.botId,hour]);
+      if (!claimed.rows.length) continue;
       await this.materialize(group.id);
-      const day = localDay(this.now, group.timezone);
       const members = (await this.db.query<Member>(`SELECT m.*,u.profile_name AS name FROM members m JOIN app_users u USING (bot_id,telegram_id) WHERE group_id=$1 AND m.bot_id=$2`, [group.id,this.botId])).rows;
       for (const member of members) {
         const text = await this.reminderText(member,day);

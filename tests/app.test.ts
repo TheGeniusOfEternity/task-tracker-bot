@@ -37,7 +37,8 @@ before(async () => {
   const sql = await readFile(new URL('../migrations/001_init.sql', import.meta.url), 'utf8')
     + '\n' + await readFile(new URL('../migrations/002_groups.sql', import.meta.url), 'utf8')
     + '\n' + await readFile(new URL('../migrations/003_coalesced_occurrences.sql', import.meta.url), 'utf8')
-    + '\n' + await readFile(new URL('../migrations/004_multiple_bots.sql', import.meta.url), 'utf8');
+    + '\n' + await readFile(new URL('../migrations/004_multiple_bots.sql', import.meta.url), 'utf8')
+    + '\n' + await readFile(new URL('../migrations/005_reminder_hour.sql', import.meta.url), 'utf8');
   if (process.env.TEST_DATABASE_URL) {
     pool = new pgDriver.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 5 });
     await pool.query(sql);
@@ -801,6 +802,67 @@ test('delivery excludes deleted tasks from queued assignments, help and aggregat
   await run(s => s.deleteTask(a,remaining.id));
   await runAt('2026-11-09',s => s.reminders());
   assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'reminder:%:2026-11-09'")).rows.length,0);
+});
+
+test('only admins can choose a group reminder hour and midnight is valid', async () => {
+  await update(callback(1900,'settings'));
+  const view = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1900:0'")).rows[0]!.payload;
+  assert.match(view.text,/19:00/);
+  await update(callback(1901,'reminderhours'));
+  const choices = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1901:0'")).rows[0]!.payload.reply_markup.inline_keyboard;
+  assert.equal(choices.slice(0,6).flat().length,24);
+  assert.equal(choices[0][0].callback_data,'reminderhour:0');
+  assert.equal(choices[4][3].text,'✅ 19:00');
+  await update(callback(1902,'reminderhour:0'));
+  assert.equal((await run(s => s.reminderSettings(a))).reminder_hour,0);
+  await update(callback(1903,'reminderhour:23',102));
+  assert.equal((await run(s => s.reminderSettings(a))).reminder_hour,0);
+  await update(callback(1904,'reminderhour:24'));
+  assert.equal((await run(s => s.reminderSettings(a))).reminder_hour,0);
+  await assert.rejects(run(s => s.setReminderHour(b,8)),UserError);
+  await assert.rejects(run(s => s.setReminderHour(a,1.5)),UserError);
+  const other = await otherBot();
+  await assert.rejects(runFor('work',s => s.setReminderHour(a,9)),UserError);
+  await runFor('work',s => s.setReminderHour(other.admin,23));
+  assert.equal((await runFor('work',s => s.reminderSettings(other.admin))).reminder_hour,23);
+  assert.equal((await run(s => s.reminderSettings(a))).reminder_hour,0);
+  assert.equal((await run(s => s.reminderSettings(outsider))).reminder_hour,19);
+});
+
+test('reminders respect the chosen hour, local midnight and daily deduplication after time edits', async () => {
+  await occurrence('daily');
+  await run(s => s.setReminderHour(a,8));
+  const at = (instant: string) => store.transaction(db => new Service(db,`hour:${sequence++}`,new Date(instant)).reminders());
+  await at('2026-11-09T04:59:00Z'); // 07:59 Moscow.
+  assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'reminder:%'")).rows.length,0);
+  await Promise.all([at('2026-11-09T05:45:00Z'),at('2026-11-09T05:45:00Z')]);
+  assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'reminder:%:2026-11-09'")).rows.length,1);
+  await run(s => s.setReminderHour(a,23));
+  await at('2026-11-09T20:30:00Z');
+  assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'reminder:%:2026-11-09'")).rows.length,1);
+  await run(s => s.setReminderHour(a,0));
+  await at('2026-11-09T21:15:00Z'); // Next local day, still November 9 in UTC.
+  assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'reminder:%:2026-11-10'")).rows.length,1);
+  assert.equal((await store.query('SELECT last_reminder_on::text FROM task_groups WHERE id=$1',[a.group_id])).rows[0]!.last_reminder_on,'2026-11-10');
+});
+
+test('a missed mailing catches up and a failed transaction leaves it eligible for retry', async () => {
+  await occurrence();
+  await run(s => s.setReminderHour(a,9));
+  await assert.rejects(store.transaction(async db => {
+    await new Service(db,'failed-mailing',new Date('2026-11-08T07:10:00Z')).reminders();
+    throw new Error('simulated database failure');
+  }));
+  assert.equal((await store.query('SELECT last_reminder_on FROM task_groups WHERE id=$1',[a.group_id])).rows[0]!.last_reminder_on,null);
+  await store.transaction(db => new Service(db,'catch-up',new Date('2026-11-08T08:30:00Z')).reminders());
+  assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'reminder:%:2026-11-08'")).rows.length,1);
+});
+
+test('Vercel has one daily trigger for each hour without a subdaily Hobby expression', async () => {
+  const config = JSON.parse(await readFile(new URL('../vercel.json',import.meta.url),'utf8'));
+  assert.equal(config.crons.length,24);
+  assert.deepEqual(config.crons.map((c: { schedule: string }) => c.schedule),Array.from({ length: 24 },(_,h) => `0 ${h} * * *`));
+  assert.ok(config.crons.every((c: { path: string }) => c.path === '/api/cron'));
 });
 
 test('a draft confirmed on a later day refreshes its automatic deadline before creation', async () => {

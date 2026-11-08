@@ -14,7 +14,7 @@ function navigationKeyboard(member?: Member) {
   const result = new InlineKeyboard();
   if (member) {
     result.text('📋 Мои задачи','mine').row().text('👥 Группа','group').row().text('📖 Журнал','history');
-    if (member.role === 'admin') result.row().text('➕ Создать задачу','new').row().text('🔗 Приглашение','invite');
+    if (member.role === 'admin') result.row().text('➕ Создать задачу','new').row().text('🔗 Приглашение','invite').row().text('⚙️ Настройки','settings');
   } else result.text('🏠 Меню','menu');
   return result;
 }
@@ -47,6 +47,20 @@ async function memberCard(s: Service, viewer: Member, targetId: number) {
   await s.screen(viewer.telegram_id, `${target.name}\n${target.role === 'admin' ? 'Администратор' : 'Участник'}\nНазвания участников настраиваются лично для тебя.`,
     keyboard([[button('📋 Задачи', `list:${targetId}:0`)], [button('✏️ Назвать для себя', `rename:${targetId}`)],
       [button('↩️ Вернуть имя Telegram', `resetname:${targetId}`)], [button('👥 Группа', 'group'),button('🏠 Меню','menu')]]));
+}
+async function settings(s: Service, viewer: Member, saved = false) {
+  const group = await s.reminderSettings(viewer);
+  const hour = String(group.reminder_hour).padStart(2,'0');
+  await s.screen(viewer.telegram_id,`${saved ? 'Час рассылки сохранён.\n\n' : ''}⚙️ Настройки группы\n\nРассылка задач: ${hour}:00 (${group.timezone}).\nОдин раз в день. На бесплатном тарифе сообщение приходит в пределах выбранного часа. Если сегодня рассылка уже была, новое время действует со следующего дня.`,keyboard([
+    [button('⏰ Час рассылки','reminderhours')],[button('🏠 Меню','menu')],
+  ]));
+}
+async function reminderHours(s: Service, viewer: Member) {
+  const group = await s.reminderSettings(viewer);
+  const hours = Array.from({ length: 24 },(_,hour) => button(`${hour === group.reminder_hour ? '✅' : '🕐'} ${String(hour).padStart(2,'0')}:00`,`reminderhour:${hour}`));
+  await s.screen(viewer.telegram_id,`Выбери час ежедневной рассылки для всей группы.\nЧасовой пояс: ${group.timezone}.`,keyboard([
+    ...Array.from({ length: 6 },(_,row) => hours.slice(row*4,row*4+4)),[button('⬅️ Назад','settings'),button('🏠 Меню','menu')],
+  ]));
 }
 function taskStatus(task: { due_on: string; completed_at: Date | null }, today: string) {
   if (task.completed_at) return { icon: '🟢',text: 'Выполнено' };
@@ -247,7 +261,7 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
       if (action === 'menu' || action === 'cancel') { await s.saveSession(uid); await main(s, uid); }
       else {
         const viewer = await s.requireMember(uid);
-        if (['group','member','mine','list','task','history','invite'].includes(action ?? '')) await s.saveSession(uid);
+        if (['group','member','mine','list','task','history','invite','settings','reminderhours'].includes(action ?? '')) await s.saveSession(uid);
         if (action === 'group') await group(s, viewer);
         else if (action === 'member') await memberCard(s, viewer, id(arg));
         else if (action === 'rename') {
@@ -262,6 +276,12 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
         else if (action === 'new') await newTask(s, viewer);
         else if (action === 'newonce') await newTask(s,viewer);
         else if (action === 'invite') await invite(s,viewer,ctx.me.username);
+        else if (action === 'settings') await settings(s,viewer);
+        else if (action === 'reminderhours') await reminderHours(s,viewer);
+        else if (action === 'reminderhour') {
+          if (!/^(?:[0-9]|1[0-9]|2[0-3])$/.test(arg ?? '')) throw new UserError('Выбери час от 00 до 23.');
+          await s.setReminderHour(viewer,Number(arg)); await s.saveSession(uid); await settings(s,viewer,true);
+        }
         else if (action === 'deletetask') {
           s.admin(viewer); const task = await s.occurrence(viewer,id(arg));
           await s.saveSession(uid,{ step: 'delete_task',occurrence: task.id });
