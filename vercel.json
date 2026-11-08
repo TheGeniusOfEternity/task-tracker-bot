@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": "npm run check",
+  "outputDirectory": "public",
+  "functions": { "api/*.ts": { "maxDuration": 60 } },
+  "crons": [{ "path": "/api/cron", "schedule": "0 16 * * *" }]
+}

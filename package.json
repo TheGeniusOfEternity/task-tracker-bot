@@ -1,0 +1,16 @@
+{
+  "name": "task-tracker-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "24.x" },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "dev": "node --import tsx --env-file=.env scripts/dev.ts",
+    "migrate": "node --import tsx --env-file=.env scripts/migrate.ts",
+    "webhook": "node --import tsx --env-file=.env scripts/webhook.ts"
+  },
+  "dependencies": { "grammy": "^1.38.0", "pg": "^8.16.0", "@vercel/functions": "^3.0.0" },
+  "devDependencies": { "@electric-sql/pglite": "^0.3.0", "@types/node": "^24.0.0", "@types/pg": "^8.15.0", "@vercel/node": "^5.0.0", "tsx": "^4.20.0", "typescript": "^5.9.0" }
+}
