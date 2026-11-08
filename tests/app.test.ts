@@ -138,27 +138,26 @@ test('group creation leaves the invitation visible until the user opens the menu
   assert.equal(messages[0]!.payload.reply_markup.inline_keyboard[1][0].callback_data,'menu');
 });
 
-test('opening an invite as an existing member shows a persistent menu without changing groups', async () => {
+test('opening an invite as an existing member shows an inline menu without changing groups', async () => {
   const anotherGroupCode = await run(s => s.invite(outsider));
   await update(message(950,`/start join_${anotherGroupCode}`));
   const reply = (await store.query("SELECT payload FROM outbox WHERE dedupe_key LIKE 'update:950:%' AND method='sendMessage'")).rows[0]!.payload;
   assert.match(reply.text,/Ты уже состоишь в группе/);
-  assert.equal(reply.reply_markup.is_persistent,true);
-  assert.equal(reply.reply_markup.resize_keyboard,true);
-  const labels = reply.reply_markup.keyboard.flat().map((button: { text: string }) => button.text);
-  for (const label of ['📋 Мои задачи','👥 Группа','📖 Журнал','🏠 Меню','➕ Создать задачу','🔗 Приглашение']) assert.ok(labels.includes(label));
+  assert.equal(reply.reply_markup.keyboard,undefined);
+  const labels = reply.reply_markup.inline_keyboard.flat().map((button: { text: string }) => button.text);
+  for (const label of ['📋 Мои задачи','👥 Группа','📖 Журнал','➕ Создать задачу','🔗 Приглашение']) assert.ok(labels.includes(label));
   assert.equal((await run(s => s.requireMember('101'))).group_id,a.group_id);
   assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'error:950:%'")).rows.length,0);
 });
 
-test('fresh and repeated joins give ordinary members role-appropriate keyboards', async () => {
+test('fresh and repeated joins give ordinary members role-appropriate inline menus', async () => {
   const code = await run(s => s.invite(a));
   await update(message(951,`/start join_${code}`,105));
   for (const updateId of [951,952]) {
     if (updateId === 952) await update(message(952,`/join ${code}`,105));
     const reply = (await store.query("SELECT payload FROM outbox WHERE dedupe_key LIKE $1 AND method='sendMessage'",[`update:${updateId}:%`])).rows[0]!.payload;
-    assert.equal(reply.reply_markup.is_persistent,true);
-    const labels = reply.reply_markup.keyboard.flat().map((button: { text: string }) => button.text);
+    assert.equal(reply.reply_markup.keyboard,undefined);
+    const labels = reply.reply_markup.inline_keyboard.flat().map((button: { text: string }) => button.text);
     assert.ok(labels.includes('👥 Группа'));
     assert.equal(labels.includes('➕ Создать задачу'),false);
     assert.equal(labels.includes('🔗 Приглашение'),false);
@@ -166,24 +165,24 @@ test('fresh and repeated joins give ordinary members role-appropriate keyboards'
   assert.equal((await run(s => s.requireMember('105'))).role,'member');
 });
 
-test('persistent keyboard navigation exits a wizard and admin-only buttons remain protected', async () => {
-  await update(message(953,'➕ Создать задачу'));
+test('inline navigation exits a wizard and admin-only buttons remain protected', async () => {
+  await update(callback(953,'new'));
   assert.equal((await run(s => s.session('101')))?.step,'task_title');
-  await update(message(954,'👥 Группа'));
+  await update(callback(954,'group'));
   assert.equal(await run(s => s.session('101')),undefined);
   assert.equal((await store.query('SELECT id FROM tasks')).rows.length,0);
   const groupView = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:954:0'")).rows[0]!.payload;
   assert.match(groupView.text,/Участники группы/);
-  await update(message(955,'➕ Создать задачу',102));
+  await update(callback(955,'new',102));
   const denied = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='error:955:0'")).rows[0]!.payload;
   assert.match(denied.text,/администратору/);
-  assert.equal(denied.reply_markup.is_persistent,true);
-  await update(message(956,'➕ Создать задачу'));
-  await update(message(957,'✖️ Отмена'));
+  assert.equal(denied.show_alert,true);
+  await update(callback(956,'new'));
+  await update(callback(957,'cancel'));
   assert.equal(await run(s => s.session('101')),undefined);
   const cancelled = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:957:0'")).rows[0]!.payload;
-  assert.match(cancelled.text,/Действие отменено/);
-  assert.equal(cancelled.reply_markup.is_persistent,true);
+  assert.equal(cancelled.reply_markup.keyboard,undefined);
+  assert.ok(cancelled.reply_markup.inline_keyboard.length > 0);
 });
 
 test('an invalid invite leaves a guest with a working menu button', async () => {
@@ -191,10 +190,39 @@ test('an invalid invite leaves a guest with a working menu button', async () => 
   assert.equal(await run(s => s.member('105')),undefined);
   const error = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='error:958:0'")).rows[0]!.payload;
   assert.match(error.text,/Код не найден/);
-  assert.equal(error.reply_markup.keyboard[0][0].text,'🏠 Меню');
-  await update(message(959,'🏠 Меню',105));
+  assert.equal(error.reply_markup.inline_keyboard[0][0].callback_data,'menu');
+  await update(callback(959,'menu',105));
   const menu = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:959:0'")).rows[0]!.payload;
   assert.match(menu.text,/Открой ссылку-приглашение/);
+});
+
+test('first menu removes the old reply keyboard once and retires the removal notice', async () => {
+  await update(message(960,'/start'));
+  await update(message(961,'/start'));
+  const removals = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='remove-reply-keyboard:101'")).rows;
+  assert.equal(removals.length,1);
+  assert.deepEqual(removals[0]!.payload.reply_markup,{ remove_keyboard: true });
+  const sent: Record<string,unknown>[] = [],deleted: unknown[] = [];
+  let messageId = 600;
+  await flushOutbox(store,async (method,payload) => {
+    if (method === 'sendMessage') { sent.push(payload); return { message_id: messageId++ }; }
+    if (method === 'deleteMessage') deleted.push(payload.message_id);
+    return {};
+  });
+  assert.deepEqual(deleted,[600,601]);
+  assert.equal((sent.at(-1)!.reply_markup as { inline_keyboard: unknown[] }).inline_keyboard.length > 0,true);
+  assert.equal(sent.some(p => !!(p.reply_markup as { keyboard?: unknown }).keyboard),false);
+});
+
+test('text prompts have an inline escape and old keyboard labels are ordinary task input', async () => {
+  await update(callback(962,'new'));
+  const prompt = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:962:0'")).rows[0]!.payload;
+  assert.equal(prompt.reply_markup.inline_keyboard[0][0].callback_data,'menu');
+  await update(message(963,'📋 Мои задачи'));
+  assert.equal((await run(s => s.session('101')))?.title,'📋 Мои задачи');
+  assert.equal((await run(s => s.session('101')))?.step,'task_owner');
+  const choice = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:963:0'")).rows[0]!.payload;
+  assert.equal(choice.reply_markup.inline_keyboard.at(-1)[0].callback_data,'menu');
 });
 
 test('new screens delete previous bot screens after successful delivery, retaining notifications', async () => {

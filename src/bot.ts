@@ -1,4 +1,4 @@
-import { Bot, BotError, InlineKeyboard, Keyboard } from 'grammy';
+import { Bot, BotError, InlineKeyboard } from 'grammy';
 import type { Update, UserFromGetMe } from 'grammy/types';
 import type { Store } from './db.js';
 import { Service, type Member, type Session } from './service.js';
@@ -9,28 +9,27 @@ export interface BotOptions { token: string; adminIds: string[]; botInfo: UserFr
 const labels: Record<string, string> = { completed: '✅ Выполнено', reopened: '↩️ Снова открыто', transferred: '🤝 Передано', help_requested: '🙋 Запрошена помощь', help_cancelled: 'Просьба отменена' };
 const keyboard = (rows: { text: string; callback_data: string }[][]) => ({ inline_keyboard: rows });
 const button = (text: string, data: string) => ({ text, callback_data: data });
-const cancelHint = '\n\nОтменить: /cancel';
-const navigation = { menu: '🏠 Меню',tasks: '📋 Мои задачи',group: '👥 Группа',history: '📖 Журнал',create: '➕ Создать задачу',invite: '🔗 Приглашение',cancel: '✖️ Отмена' } as const;
+const cancelHint = '\n\n«← Меню» отменит текущее действие.';
 function navigationKeyboard(member?: Member) {
-  const result = new Keyboard();
+  const result = new InlineKeyboard();
   if (member) {
-    result.text(navigation.tasks).text(navigation.group).row().text(navigation.history).text(navigation.menu);
-    if (member.role === 'admin') result.row().text(navigation.create).text(navigation.invite);
-    result.row().text(navigation.cancel);
-  } else result.text(navigation.menu);
-  return result.persistent().resized();
+    result.text('📋 Мои задачи','mine').row().text('👥 Группа','group').row().text('📖 Журнал','history');
+    if (member.role === 'admin') result.row().text('➕ Создать задачу','new').row().text('🔗 Приглашение','invite');
+  } else result.text('← Меню','menu');
+  return result;
 }
 function id(value: string | undefined) {
   if (!value || !/^[1-9]\d{0,9}$/.test(value)) throw new UserError('Некорректная кнопка. Открой меню заново: /start');
   return Number(value);
 }
 async function main(s: Service, uid: string, notice?: string) {
+  await s.enqueue('sendMessage',{ chat_id: uid,text: 'Открываю меню…',reply_markup: { remove_keyboard: true },__screen: true },`remove-reply-keyboard:${uid}`);
   const member = await s.member(uid);
   if (!member) {
     await s.screen(uid, '📋 Трекер задач\nОткрой ссылку-приглашение от администратора или введи /join КОД.\nАдминистратор бота может создать группу: /create Название\nТвой Telegram ID: /id',navigationKeyboard());
     return;
   }
-  await s.screen(uid, `${notice ? `${notice}\n\n` : ''}Выбери раздел на клавиатуре под полем ввода.`,navigationKeyboard(member));
+  await s.screen(uid, `${notice ? `${notice}\n\n` : ''}Что хочешь сделать?`,navigationKeyboard(member));
 }
 async function joinAndOpenMenu(s: Service, uid: string, code: string) {
   await s.saveSession(uid);
@@ -126,7 +125,7 @@ async function textInput(s: Service, uid: string, text: string) {
   if (session.step === 'task_title') {
     if (!text.trim() || text.length > 160) throw new UserError('Название должно содержать от 1 до 160 символов.');
     await s.saveSession(uid, { step: 'task_owner', title: text.trim() });
-    await s.screen(uid, 'Кому назначить задачу?', keyboard((await s.members(viewer)).map(m => [button(m.name, `owner:${m.id}`)])));
+    await s.screen(uid, 'Кому назначить задачу?', keyboard([...(await s.members(viewer)).map(m => [button(m.name, `owner:${m.id}`)]),[button('← Меню','menu')]]));
   } else if (session.step === 'task_date') {
     if (!validDay(text) || text < await s.today(viewer) || text > '2100-12-31') throw new UserError('Введи дату от сегодняшнего дня до 2100 года в формате ГГГГ-ММ-ДД.');
     const next = { ...session, start: text };
@@ -194,25 +193,12 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
     bot.command('history', async () => history(s, await s.requireMember(uid)));
     bot.command('new', async () => newTask(s, await s.requireMember(uid)));
     bot.command('invite', async ctx => invite(s,await s.requireMember(uid),ctx.me.username));
-    bot.hears(Object.values(navigation),async ctx => {
-      await s.saveSession(uid);
-      const text = ctx.message?.text;
-      if (text === navigation.menu || text === navigation.cancel) {
-        await main(s,uid,text === navigation.cancel ? 'Действие отменено.' : undefined);
-        return;
-      }
-      const viewer = await s.requireMember(uid);
-      if (text === navigation.tasks) await taskList(s,viewer,viewer.id);
-      else if (text === navigation.group) await group(s,viewer);
-      else if (text === navigation.history) await history(s,viewer);
-      else if (text === navigation.create) await newTask(s,viewer);
-      else if (text === navigation.invite) await invite(s,viewer,ctx.me.username);
-    });
     bot.on('callback_query:data', async ctx => {
       const [action, arg, pageArg] = ctx.callbackQuery.data.split(':');
       if (action === 'menu' || action === 'cancel') { await s.saveSession(uid); await main(s, uid); }
       else {
         const viewer = await s.requireMember(uid);
+        if (['group','member','mine','list','task','history','invite'].includes(action ?? '')) await s.saveSession(uid);
         if (action === 'group') await group(s, viewer);
         else if (action === 'member') await memberCard(s, viewer, id(arg));
         else if (action === 'rename') {
@@ -255,13 +241,14 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
             [button('Один раз', 'kind:once'), button('Ежедневно', 'kind:daily')],
             [button('По дням недели', 'kind:weekly'), button('Ежемесячно', 'kind:monthly')],
             [button('День недели в месяце', 'kind:monthly_weekday')],
+            [button('← Меню','menu')],
           ]));
         } else if (action === 'kind') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_kind');
           if (!['once', 'daily', 'weekly', 'monthly', 'monthly_weekday'].includes(arg ?? '')) throw new UserError('Выбери расписание заново.');
           if (arg === 'monthly_weekday') {
             await s.saveSession(uid, { ...session, step: 'task_ordinal', kind: arg });
-            await s.screen(uid, 'Какой по счёту день недели в месяце?', keyboard([1,2,3,4,-1].map(n => [button(ordinalNames[n]!, `ordinal:${n}`)])));
+            await s.screen(uid, 'Какой по счёту день недели в месяце?', keyboard([...[1,2,3,4,-1].map(n => [button(ordinalNames[n]!, `ordinal:${n}`)]),[button('← Меню','menu')]]));
           } else {
             await s.saveSession(uid, { ...session, step: 'task_date', kind: arg });
             await s.screen(uid, `Введи ${arg === 'once' ? 'срок' : 'дату начала'} в формате ГГГГ-ММ-ДД.\nСегодня: ${localDay(options.now)}.${cancelHint}`);
@@ -271,7 +258,7 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
           const ordinal = Number(arg);
           if (![1,2,3,4,-1].includes(ordinal)) throw new UserError('Выбери порядковый номер кнопкой.');
           await s.saveSession(uid, { ...session, step: 'task_month_weekday', ordinal });
-          await s.screen(uid, 'Какой день недели?', keyboard(weekdayNames.map((name,i) => [button(name, `monthweekday:${i + 1}`)])));
+          await s.screen(uid, 'Какой день недели?', keyboard([...weekdayNames.map((name,i) => [button(name, `monthweekday:${i + 1}`)]),[button('← Меню','menu')]]));
         } else if (action === 'monthweekday') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_month_weekday');
           const weekday = id(arg);

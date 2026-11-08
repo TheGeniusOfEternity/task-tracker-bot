@@ -27,7 +27,7 @@ export class Service {
   async screen(chatId: string | number, text: string, keyboard?: unknown) {
     await this.enqueue('sendMessage', { chat_id: chatId,text,__screen: true,
       ...(this.previousMessageId ? { __previous_message_id: this.previousMessageId } : {}),
-      ...(keyboard ? { reply_markup: keyboard } : {}) });
+      reply_markup: keyboard ?? { inline_keyboard: [[{ text: '← Меню',callback_data: 'menu' }]] } });
   }
   async member(telegramId: string): Promise<Member | undefined> {
     return (await this.db.query<Member>(`SELECT m.*, u.profile_name AS name FROM members m JOIN app_users u USING (bot_id,telegram_id) WHERE m.telegram_id=$1 AND m.bot_id=$2`, [telegramId,this.botId])).rows[0];
