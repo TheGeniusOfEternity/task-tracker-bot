@@ -217,7 +217,7 @@ test('first menu removes the old reply keyboard once and retires the removal not
 test('text prompts have an inline escape and old keyboard labels are ordinary task input', async () => {
   await update(callback(962,'new'));
   const prompt = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:962:0'")).rows[0]!.payload;
-  assert.deepEqual(prompt.reply_markup.inline_keyboard,[[{ text: 'Отмена',callback_data: 'cancel' }]]);
+  assert.deepEqual(prompt.reply_markup.inline_keyboard,[[{ text: '❌ Отмена',callback_data: 'cancel' }]]);
   assert.doesNotMatch(prompt.text,/отменит/);
   await update(message(963,'📋 Мои задачи'));
   assert.equal((await run(s => s.session('101')))?.title,'📋 Мои задачи');
@@ -648,8 +648,8 @@ test('automatic deadlines exclude today for once and never backfill recurring we
     assert.equal(session.step,'task_confirm');
     assert.equal(firstDue(session as unknown as Schedule),expected);
     const summary = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
-    assert.deepEqual(summary.reply_markup.inline_keyboard,[[
-      { text: 'Назад',callback_data: 'taskback' },{ text: 'Отмена',callback_data: 'cancel' },{ text: 'Создать',callback_data: 'createtask' },
+    assert.deepEqual(summary.reply_markup.inline_keyboard,[[{ text: '📅 Изменить дату',callback_data: 'taskdate' }],[
+      { text: '⬅️ Назад',callback_data: 'taskback' },{ text: '❌ Отмена',callback_data: 'cancel' },{ text: '✅ Создать',callback_data: 'createtask' },
     ]]);
     await atWednesday(callback(id++,'createtask'));
     const last = (await store.query('SELECT id FROM tasks ORDER BY id DESC LIMIT 1')).rows[0]!.id;
@@ -659,7 +659,7 @@ test('automatic deadlines exclude today for once and never backfill recurring we
   }
 });
 
-test('wizard back navigation preserves choices and optional dates can be reset', async () => {
+test('wizard preserves choices and edits dates only from confirmation', async () => {
   let id = 1400;
   const cb = (data: string) => update(callback(id++,data));
   const step = async (expected: string) => assert.equal((await run(s => s.session('101')))?.step,expected);
@@ -667,22 +667,67 @@ test('wizard back navigation preserves choices and optional dates can be reset',
   await update(message(id++,'Новое название')); await cb(`owner:${b.id}`); await cb('taskday:3');
   await cb('taskback'); await step('task_owner'); await cb(`owner:${b.id}`);
   assert.deepEqual((await run(s => s.session('101')))?.weekdays,[3]);
-  await cb('taskdaysdone'); await cb('taskdate'); await step('task_date');
+  await cb('taskdaysdone');
+  const period = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  assert.deepEqual(period.reply_markup.inline_keyboard.flat().map((b: { callback_data: string }) => b.callback_data),['period:once','period:weekly','period:monthly','taskback','cancel']);
+  await cb('taskdate'); await step('task_period'); // Stale date button cannot bypass confirmation.
+  await cb('period:once'); await cb('taskdate'); await step('task_date');
+  const datePrompt = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  assert.deepEqual(datePrompt.reply_markup.inline_keyboard,[[{ text: '⬅️ Назад',callback_data: 'taskback' }]]);
   await update(message(id++,'не дата')); await step('task_date');
   const error = (await store.query("SELECT payload FROM outbox WHERE dedupe_key=$1",[`error:${id-1}:0`])).rows[0]!.payload;
-  assert.deepEqual(error.reply_markup.inline_keyboard[0].map((b: { callback_data: string }) => b.callback_data),['taskback','cancel']);
-  await update(message(id++,'2026-12-20')); await step('task_period');
-  await cb('period:once'); await step('task_confirm');
+  assert.deepEqual(error.reply_markup.inline_keyboard[0].map((b: { callback_data: string }) => b.callback_data),['taskback']);
+  await cb('taskback'); await step('task_confirm');
+  assert.equal((await run(s => s.session('101')))?.start,'2026-11-11');
+  await cb('taskdate'); await update(message(id++,'2026-12-20')); await step('task_confirm');
   assert.equal((await run(s => s.session('101')))?.start,'2026-12-20');
-  await cb('taskback'); await cb('taskdate'); await cb('taskdateauto');
-  await cb('period:once'); assert.equal((await run(s => s.session('101')))?.start,'2026-11-11');
+  await cb('taskdate'); await cb('taskback'); await step('task_confirm');
+  assert.equal((await run(s => s.session('101')))?.start,'2026-12-20');
   await cb('taskback'); await cb('period:monthly'); await step('task_ordinal');
   await cb('ordinal:1'); await step('task_confirm'); await cb('taskback'); await step('task_ordinal');
   await cb('taskback'); await step('task_period'); await cb('taskback'); await step('task_days');
-  await cb('taskdaysdone'); await cb('taskreminders'); await cb('taskback'); await step('task_period');
-  await cb('period:weekly'); await cb('cancel');
+  await cb('taskdaysdone'); await cb('period:weekly'); await cb('cancel');
   assert.equal(await run(s => s.session('101')),undefined);
   assert.equal((await store.query('SELECT id FROM tasks')).rows.length,0);
+});
+
+test('task card offers either request help or cancel help and updates immediately', async () => {
+  const t = await occurrence();
+  let id = 1600;
+  const cb = (data: string) => update(callback(id++,data));
+  const card = async () => (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  const actions = (payload: { reply_markup: { inline_keyboard: { callback_data: string }[][] } }) => payload.reply_markup.inline_keyboard.flat().map((b: { callback_data: string }) => b.callback_data);
+  await cb(`task:${t.id}`);
+  assert.ok(actions(await card()).includes(`help:${t.id}`));
+  assert.equal(actions(await card()).includes(`cancelhelp:${t.id}`),false);
+  assert.equal((await card()).reply_markup.inline_keyboard.at(-1)[0].text,'⬅️ Назад');
+  await cb(`help:${t.id}`); await cb(`pickhelp:${b.id}`); await cb('sendhelp');
+  assert.ok(actions(await card()).includes(`cancelhelp:${t.id}`));
+  assert.equal(actions(await card()).includes(`help:${t.id}`),false);
+  await cb(`cancelhelp:${t.id}`);
+  assert.ok(actions(await card()).includes(`help:${t.id}`));
+  assert.equal(actions(await card()).includes(`cancelhelp:${t.id}`),false);
+  await cb(`done:${t.id}`);
+  assert.match((await card()).text,/🟢 Выполнено/);
+  assert.equal(actions(await card()).some((a: string) => /^(help|cancelhelp):/.test(a)),false);
+});
+
+test('task lists and descriptions use colored status markers without the extra subtitle', async () => {
+  for (const [day,title] of [['2026-11-07','Прошлая'],['2026-11-08','Сегодняшняя'],['2026-11-09','Будущая']]) {
+    await run(s => s.createTask(a,title!,a.id,{ kind: 'once',start: day! }));
+  }
+  await update(callback(1700,'mine'));
+  const list = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1700:0'")).rows[0]!.payload;
+  assert.equal(list.text,'Задачи: Максим');
+  assert.deepEqual(list.reply_markup.inline_keyboard.slice(0,3).map((r: { text: string }[]) => r[0]!.text),[
+    '🔴 Прошлая · 2026-11-07','🟡 Сегодняшняя · 2026-11-08','🔵 Будущая · 2026-11-09',
+  ]);
+  let id = 1701;
+  for (const [row,status] of [[0,'🔴 Просрочено'],[1,'🟡 На сегодня'],[2,'🔵 Предстоит']] as const) {
+    await update(callback(id,list.reply_markup.inline_keyboard[row][0].callback_data));
+    const card = (await store.query('SELECT payload FROM outbox WHERE dedupe_key=$1',[`update:${id++}:0`])).rows[0]!.payload;
+    assert.ok(card.text.includes(status));
+  }
 });
 
 test('a draft confirmed on a later day refreshes its automatic deadline before creation', async () => {
@@ -846,15 +891,13 @@ test('interactive task creation survives updates and uses fixed assignment', asy
   await update(callback(231,'taskday:3'));
   await update(callback(232,'taskday:5'));
   await update(callback(233,'taskdaysdone'));
-  await update(callback(235,'taskreminders'));
-  await update(callback(250,'overdue:daily'));
   await update(callback(234,'period:weekly'));
   await update(callback(26,'createtask'));
   await update(callback(26,'createtask'));
   const tasks = (await store.query('SELECT * FROM tasks')).rows;
   assert.equal(tasks.length, 1); assert.equal(tasks[0]!.owner_id, b.id);
   const dates = (await store.query('SELECT due_on::text FROM occurrences ORDER BY due_on')).rows.map(r => r.due_on);
-  assert.deepEqual(dates,['2026-11-09','2026-11-11','2026-11-13']);
+  assert.deepEqual(dates,['2026-11-09']);
   assert.equal(await run(s => s.session('101')), undefined);
 });
 

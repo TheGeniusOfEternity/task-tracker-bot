@@ -6,10 +6,11 @@ import { hashCode, UserError } from './security.js';
 export interface Member { id: number; group_id: number; bot_id: string; telegram_id: string; role: 'admin' | 'member'; name: string }
 export interface Occurrence {
   id: number; task_id: number; group_id: number; title: string; due_on: string;
-  original_owner_id: number; assignee_id: number; completed_by: number | null; completed_at: Date | null; schedule: Schedule;
+  original_owner_id: number; assignee_id: number; completed_by: number | null; completed_at: Date | null; schedule: Schedule; help_pending: boolean;
 }
 export type Session = { step: string; [key: string]: unknown };
-const dateColumns = `o.id, o.task_id, o.group_id, t.title, o.due_on::text, o.original_owner_id, o.assignee_id, o.completed_by, o.completed_at, t.schedule`;
+const dateColumns = `o.id, o.task_id, o.group_id, t.title, o.due_on::text, o.original_owner_id, o.assignee_id, o.completed_by, o.completed_at, t.schedule,
+  EXISTS(SELECT 1 FROM help_requests h WHERE h.occurrence_id=o.id AND h.state='pending') AS help_pending`;
 export class Service {
   private sequence = 0;
   constructor(readonly db: Database, readonly key: string, readonly now = new Date(), readonly botId = 'default', readonly previousMessageId?: number) {}
@@ -27,7 +28,7 @@ export class Service {
   async screen(chatId: string | number, text: string, keyboard?: unknown) {
     await this.enqueue('sendMessage', { chat_id: chatId,text,__screen: true,
       ...(this.previousMessageId ? { __previous_message_id: this.previousMessageId } : {}),
-      reply_markup: keyboard ?? { inline_keyboard: [[{ text: '← Меню',callback_data: 'menu' }]] } });
+      reply_markup: keyboard ?? { inline_keyboard: [[{ text: '🏠 Меню',callback_data: 'menu' }]] } });
   }
   async member(telegramId: string): Promise<Member | undefined> {
     return (await this.db.query<Member>(`SELECT m.*, u.profile_name AS name FROM members m JOIN app_users u USING (bot_id,telegram_id) WHERE m.telegram_id=$1 AND m.bot_id=$2`, [telegramId,this.botId])).rows[0];
