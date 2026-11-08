@@ -16,6 +16,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import type { Update } from 'grammy/types';
 import { botConfigs, databaseUrl, findBot } from '../src/config.js';
 import { bindBot } from '../src/registry.js';
+import { failureDetails } from '../src/diagnostics.js';
 
 const now = new Date('2026-11-08T16:00:00Z');
 const options = { token: '123456:fake-test-token', adminIds: ['101'], now,
@@ -102,6 +103,128 @@ test('bot configuration supports old settings, secret references and Neon prefix
   assert.equal(databaseUrl({ DATABASE_POSTGRES_URL: 'integration-url' }),'integration-url');
   assert.equal(databaseUrl({ DATABASE_URL: 'explicit',DATABASE_POSTGRES_URL: 'integration' }),'explicit');
   assert.throws(() => databaseUrl({}),/DATABASE_URL/);
+});
+
+test('failure diagnostics retain timeout categories without exposing nested credentials or payloads', () => {
+  const cause = Object.assign(new Error('Connection timeout: postgres://user:secret@example/db'),{ code: 'ETIMEDOUT',query: 'secret SQL' });
+  const result = failureDetails(new Error('token=secret', { cause }));
+  assert.deepEqual(result,{ kind: 'Error',code: 'ETIMEDOUT',timeout: true });
+  assert.equal(JSON.stringify(result).includes('secret'),false);
+  assert.deepEqual(failureDetails({ name: 'secret',code: 'secret',message: 'private' }),{ kind: 'Error',timeout: false });
+});
+
+test('invitations contain one shareable deep link to the current bot and support joining', async () => {
+  await update(message(910,'/invite'));
+  const payload = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  const match = payload.text.match(/https:\/\/t\.me\/test_bot\?start=join_([A-F0-9]+)/);
+  assert.ok(match);
+  assert.equal(payload.text.split(match[1]).length - 1,1);
+  assert.equal(payload.text.includes('/join '),false);
+  assert.equal(payload.reply_markup.inline_keyboard[0][0].url,match[0]);
+  await update(message(911,`/start join_${match[1]}`,105));
+  assert.equal((await run(s => s.requireMember('105'))).group_id,a.group_id);
+  assert.equal((await run(s => s.requireMember('105'))).role,'member');
+  await otherBot();
+  await processUpdate(store,message(912,'/invite'),{ ...options,botId: 'work',botInfo: { ...options.botInfo,id: 223456,username: 'work_test_bot' } });
+  const workPayload = (await store.query("SELECT payload FROM outbox WHERE bot_id='work' AND method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  assert.match(workPayload.text,/https:\/\/t\.me\/work_test_bot\?start=join_/);
+});
+
+test('group creation leaves the invitation visible until the user opens the menu', async () => {
+  await processUpdate(store,message(920,'/create Новая группа',106),{ ...options,adminIds: ['106'] });
+  const messages = (await store.query("SELECT payload FROM outbox WHERE payload->>'chat_id'='106' AND method='sendMessage'")).rows;
+  assert.equal(messages.length,1);
+  assert.match(messages[0]!.payload.text,/Группа создана/);
+  assert.equal(messages[0]!.payload.reply_markup.inline_keyboard[1][0].callback_data,'menu');
+});
+
+test('new screens delete previous bot screens after successful delivery, retaining notifications', async () => {
+  await run(s => s.screen('101','Первый экран'));
+  await run(s => s.send('101','Важное уведомление'));
+  await run(s => s.screen('101','Второй экран'));
+  const calls: { method: string; payload: Record<string,unknown> }[] = [];
+  let messageId = 100;
+  await flushOutbox(store,async (method,payload) => {
+    assert.equal(Object.keys(payload).some(key => key.startsWith('__')),false);
+    calls.push({ method,payload });
+    return method === 'sendMessage' ? { message_id: messageId++ } : {};
+  });
+  assert.deepEqual(calls.filter(c => c.method === 'deleteMessage').map(c => c.payload.message_id),[100]);
+  const current = (await store.query("SELECT payload FROM outbox WHERE payload->>'__screen'='true' AND payload->>'__retired'='false'")).rows;
+  assert.equal(current.length,1); assert.equal(current[0]!.payload.__message_id,102);
+});
+
+test('failed replacement keeps the previous screen until the new screen is delivered', async () => {
+  await run(s => s.screen('101','Первый'));
+  await flushOutbox(store,async () => ({ message_id: 200 }));
+  await run(s => s.screen('101','Второй'));
+  await flushOutbox(store,async () => { throw new TelegramError(500); });
+  assert.equal((await store.query("SELECT id FROM outbox WHERE method='deleteMessage'")).rows.length,0);
+  await store.query("UPDATE outbox SET available_at=now()-interval '1 second' WHERE state='pending'");
+  const removed: unknown[] = [];
+  await flushOutbox(store,async (method,payload) => {
+    if (method === 'deleteMessage') removed.push(payload.message_id);
+    return method === 'sendMessage' ? { message_id: 201 } : {};
+  });
+  assert.deepEqual(removed,[200]);
+});
+
+test('late delivery of an older screen cannot replace or delete the newest screen', async () => {
+  await run(s => s.screen('101','Старый'));
+  await run(s => s.screen('101','Новый'));
+  let release!: () => void,started!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const active = new Promise<void>(resolve => { started = resolve; });
+  const older = flushOutbox(store,async () => { started(); await gate; return { message_id: 301 }; },'default',1);
+  await active;
+  await flushOutbox(store,async () => ({ message_id: 302 }),'default',1);
+  release(); await older;
+  const removed: unknown[] = [];
+  await flushOutbox(store,async (method,payload) => { if (method === 'deleteMessage') removed.push(payload.message_id); return {}; });
+  assert.deepEqual(removed,[301]);
+  const current = (await store.query("SELECT payload FROM outbox WHERE payload->>'__screen'='true' AND payload->>'__retired'='false'")).rows;
+  assert.equal(current[0]!.payload.__message_id,302);
+});
+
+test('screen cleanup is isolated by bot and can retire the clicked legacy menu', async () => {
+  await otherBot();
+  await runFor('work',s => s.screen('101','Рабочий экран'));
+  await flushOutbox(store,async () => ({ message_id: 401 }),'work');
+  await update(callback(930,'group'));
+  const removed: unknown[] = [];
+  await flushOutbox(store,async (method,payload) => {
+    if (method === 'deleteMessage') removed.push(payload.message_id);
+    return method === 'sendMessage' ? { message_id: 402 } : {};
+  });
+  assert.deepEqual(removed,[1]);
+  assert.equal((await store.query("SELECT payload FROM outbox WHERE bot_id='work' AND payload->>'__screen'='true'")).rows[0]!.payload.__retired,false);
+});
+
+test('history paginates on one screen instead of deleting earlier chunks of the same view', async () => {
+  const t = await occurrence();
+  await run(async s => { for (let i = 0;i < 13;i++) await s.event(t.id,a.id,'help_cancelled'); });
+  await update(message(940,'/history'));
+  let screens = (await store.query("SELECT payload FROM outbox WHERE dedupe_key LIKE 'update:940:%' AND method='sendMessage'")).rows;
+  assert.equal(screens.length,1);
+  assert.match(screens[0]!.payload.text,/страница 1/);
+  assert.ok(screens[0]!.payload.text.length < 4096);
+  assert.equal(screens[0]!.payload.reply_markup.inline_keyboard[0][0].callback_data,'history:1');
+  await update(callback(941,'history:1'));
+  screens = (await store.query("SELECT payload FROM outbox WHERE dedupe_key LIKE 'update:941:%' AND method='sendMessage'")).rows;
+  assert.equal(screens.length,1); assert.match(screens[0]!.payload.text,/страница 2/);
+});
+
+test('an expired or already deleted old message does not prevent displaying the replacement', async () => {
+  await run(s => s.screen('101','Старый'));
+  await flushOutbox(store,async () => ({ message_id: 501 }));
+  await run(s => s.screen('101','Новый'));
+  await flushOutbox(store,async method => {
+    if (method === 'deleteMessage') throw new TelegramError(400);
+    return { message_id: 502 };
+  });
+  const current = (await store.query("SELECT payload,state FROM outbox WHERE payload->>'__message_id'='502'")).rows[0]!;
+  assert.equal(current.state,'sent'); assert.equal(current.payload.__retired,false);
+  assert.equal((await store.query("SELECT state FROM outbox WHERE method='deleteMessage'")).rows[0]!.state,'dead');
 });
 
 test('same Telegram users can belong to different bots with private names and groups', async () => {

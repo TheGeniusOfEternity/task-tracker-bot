@@ -4,6 +4,7 @@ import { getStore } from '../src/db.js';
 import { Service } from '../src/service.js';
 import { deliver, ensureBot } from '../src/runtime.js';
 import { botConfigs } from '../src/config.js';
+import { failureDetails } from '../src/diagnostics.js';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') { res.setHeader('Allow', 'GET'); return res.status(405).end(); }
@@ -25,15 +26,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           await db.query("DELETE FROM processed_updates WHERE bot_id=$1 AND created_at<now()-interval '30 days'",[config.id]);
         });
         results.push({ bot: config.id, ...await deliver(config,25,Math.max(500,Math.floor(18000/configs.length))) });
-      } catch {
+      } catch (error) {
         failed = true;
-        console.error(`Reminder job failed for bot ${config.id}`);
+        console.error(`Reminder job failed for bot ${config.id}`,failureDetails(error));
         results.push({ bot: config.id,error: 'processing failed' });
       }
     }
     return res.status(failed ? 500 : 200).json({ ok: !failed, bots: results });
-  } catch {
-    console.error('Reminder job failed');
+  } catch (error) {
+    console.error('Reminder job failed',failureDetails(error));
     return res.status(500).json({ ok: false });
   }
 }

@@ -12,7 +12,7 @@ export type Session = { step: string; [key: string]: unknown };
 const dateColumns = `o.id, o.task_id, o.group_id, t.title, o.due_on::text, o.original_owner_id, o.assignee_id, o.completed_by, o.completed_at, t.schedule`;
 export class Service {
   private sequence = 0;
-  constructor(readonly db: Database, readonly key: string, readonly now = new Date(), readonly botId = 'default') {}
+  constructor(readonly db: Database, readonly key: string, readonly now = new Date(), readonly botId = 'default', readonly previousMessageId?: number) {}
   private assertMember(member: Member) {
     if (member.bot_id !== this.botId) throw new UserError('Этот участник относится к другому боту.');
   }
@@ -23,6 +23,11 @@ export class Service {
   }
   async send(chatId: string | number, text: string, keyboard?: unknown, key?: string) {
     await this.enqueue('sendMessage', { chat_id: chatId, text, ...(keyboard ? { reply_markup: keyboard } : {}) }, key);
+  }
+  async screen(chatId: string | number, text: string, keyboard?: unknown) {
+    await this.enqueue('sendMessage', { chat_id: chatId,text,__screen: true,
+      ...(this.previousMessageId ? { __previous_message_id: this.previousMessageId } : {}),
+      ...(keyboard ? { reply_markup: keyboard } : {}) });
   }
   async member(telegramId: string): Promise<Member | undefined> {
     return (await this.db.query<Member>(`SELECT m.*, u.profile_name AS name FROM members m JOIN app_users u USING (bot_id,telegram_id) WHERE m.telegram_id=$1 AND m.bot_id=$2`, [telegramId,this.botId])).rows[0];

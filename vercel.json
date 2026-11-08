@@ -3,6 +3,7 @@
   "framework": null,
   "buildCommand": "npm run check",
   "outputDirectory": "public",
+  "regions": ["iad1"],
   "functions": { "api/*.ts": { "maxDuration": 60 } },
   "crons": [{ "path": "/api/cron", "schedule": "0 16 * * *" }]
 }

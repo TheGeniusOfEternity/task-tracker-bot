@@ -11,7 +11,7 @@ export class TelegramError extends Error {
 export type Transport = (method: string, payload: Record<string, unknown>) => Promise<{ message_id?: number }>;
 export function telegramTransport(token: string, timeoutMs = 8000): Transport {
   return async (method, payload) => {
-    if (!['sendMessage', 'editMessageReplyMarkup', 'answerCallbackQuery'].includes(method)) throw new Error('Unsupported outbox method');
+    if (!['sendMessage', 'editMessageReplyMarkup', 'answerCallbackQuery', 'deleteMessage'].includes(method)) throw new Error('Unsupported outbox method');
     const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(timeoutMs),
     });
@@ -39,9 +39,33 @@ export async function flushOutbox(store: Store, transport: Transport, botId = 'd
     if (!job) break;
     if ('skip' in job) continue;
     try {
-      const result = await transport(job.method, job.payload);
+      const { __screen,__previous_message_id,__message_id,__retired,...telegramPayload } = job.payload;
+      const result = await transport(job.method, telegramPayload);
       await store.transaction(async db => {
         await db.query("UPDATE outbox SET state='sent',lease_until=NULL WHERE id=$1", [job.id]);
+        if (__screen === true && result.message_id) {
+          // Serialize screen changes per bot and viewer, even when delivery workers finish out of order.
+          await db.query('SELECT telegram_id FROM app_users WHERE bot_id=$1 AND telegram_id=$2 FOR UPDATE',[botId,job.payload.chat_id]);
+          const previous = (await db.query<{ id: number; payload: Record<string,unknown> }>(`SELECT id,payload FROM outbox
+            WHERE bot_id=$1 AND id<>$2 AND state='sent' AND method='sendMessage'
+              AND payload->>'chat_id'=$3 AND payload->>'__screen'='true'
+              AND payload ? '__message_id' AND coalesce(payload->>'__retired','false')<>'true'
+            ORDER BY id DESC LIMIT 1`,[botId,job.id,String(job.payload.chat_id)])).rows[0];
+          const superseded = !!previous && previous.id > job.id;
+          await db.query(`UPDATE outbox SET payload=payload || $1::jsonb WHERE id=$2`,[
+            JSON.stringify({ __message_id: result.message_id,__retired: superseded }),job.id]);
+          const s = new Service(db,`screen:${job.id}`,undefined,botId);
+          const remove = async (messageId: unknown) => {
+            if (typeof messageId !== 'number' || !Number.isSafeInteger(messageId) || messageId <= 0) return;
+            await s.enqueue('deleteMessage',{ chat_id: job.payload.chat_id,message_id: messageId },`screen-remove:${job.payload.chat_id}:${messageId}`);
+          };
+          if (superseded) await remove(result.message_id);
+          else if (previous) {
+            await db.query(`UPDATE outbox SET payload=payload || '{"__retired":true}'::jsonb WHERE id=$1`,[previous.id]);
+            await remove(previous.payload.__message_id);
+          }
+          if (__previous_message_id !== result.message_id) await remove(__previous_message_id);
+        }
         if (job.guard_help_id && job.recipient_id && result.message_id) {
           await db.query('UPDATE help_recipients SET message_id=$1 WHERE request_id=$2 AND member_id=$3', [result.message_id, job.guard_help_id, job.recipient_id]);
           const state = (await db.query<{ state: string }>('SELECT state FROM help_requests WHERE id=$1', [job.guard_help_id])).rows[0]?.state;
