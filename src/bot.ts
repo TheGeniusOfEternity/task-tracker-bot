@@ -76,6 +76,7 @@ async function taskCard(s: Service, viewer: Member, occurrenceId: number) {
       rows.push([t.help_pending ? button('🚫 Отменить просьбу о помощи',`cancelhelp:${t.id}`) : button('🙋 Попросить помощи',`help:${t.id}`)]);
     }
   }
+  if (viewer.role === 'admin') rows.push([button('🗑 Удалить задачу',`deletetask:${t.id}`)]);
   rows.push([button('⬅️ Назад', `list:${t.assignee_id}:0`),button('🏠 Меню','menu')]);
   const status = taskStatus(t,await s.today(viewer));
   await s.screen(viewer.telegram_id, `📋 ${t.title}\nСрок: ${t.due_on} (до конца дня, Москва)\nИсполнитель: ${await s.name(viewer, t.assignee_id)}\n${scheduleLabel(t.schedule)}${t.schedule.overdue === 'weekends' ? '\nПри просрочке: напоминания по субботам и воскресеньям, одна открытая задача.' : ''}\n${status.icon} ${status.text}`, keyboard(rows));
@@ -261,7 +262,17 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
         else if (action === 'new') await newTask(s, viewer);
         else if (action === 'newonce') await newTask(s,viewer);
         else if (action === 'invite') await invite(s,viewer,ctx.me.username);
-        else if (action === 'done' || action === 'undo') { await s.complete(viewer, id(arg), action === 'undo'); await taskCard(s, viewer, id(arg)); }
+        else if (action === 'deletetask') {
+          s.admin(viewer); const task = await s.occurrence(viewer,id(arg));
+          await s.saveSession(uid,{ step: 'delete_task',occurrence: task.id });
+          await s.screen(uid,`Удалить задачу «${task.title}»?\n\nВсе её повторения исчезнут из списков, напоминания и просьбы о помощи прекратятся. Журнал выполнений сохранится.`,keyboard([
+            [button('⬅️ Отмена',`task:${task.id}`),button('🗑 Удалить','confirmdelete')],
+          ]));
+        } else if (action === 'confirmdelete') {
+          s.admin(viewer); const session = await s.session(uid); requireStep(session,'delete_task');
+          const owner = await s.deleteTask(viewer,Number(session.occurrence));
+          await s.saveSession(uid); await taskList(s,viewer,owner);
+        } else if (action === 'done' || action === 'undo') { await s.complete(viewer, id(arg), action === 'undo'); await taskCard(s, viewer, id(arg)); }
         else if (action === 'help') {
           const task = await s.occurrence(viewer, id(arg));
           if (task.assignee_id !== viewer.id || task.completed_at) throw new UserError('Попросить помощи можно только со своей невыполненной задачей.');

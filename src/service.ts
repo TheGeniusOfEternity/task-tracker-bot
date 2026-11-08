@@ -147,7 +147,7 @@ export class Service {
     await this.target(viewer, ownerId);
     await this.materialize(viewer.group_id);
     return (await this.db.query<Occurrence>(`SELECT ${dateColumns} FROM occurrences o JOIN tasks t ON t.id=o.task_id
-      WHERE o.group_id=$1 AND o.assignee_id=$2 AND o.completed_at IS NULL
+      WHERE o.group_id=$1 AND o.assignee_id=$2 AND o.completed_at IS NULL AND t.active
       ORDER BY o.due_on,o.id LIMIT 6 OFFSET $3`, [viewer.group_id, ownerId, Math.max(0, Math.min(10000, page)) * 5])).rows;
   }
   async occurrence(viewer: Member, id: number, lock = false): Promise<Occurrence> {
@@ -155,12 +155,20 @@ export class Service {
     if (lock) {
       // Match materialize's lock order: template first, occurrence second.
       await this.db.query(`SELECT t.id FROM tasks t JOIN occurrences o ON o.task_id=t.id
-        WHERE o.id=$1 AND o.group_id=$2 AND o.group_id IN (SELECT id FROM task_groups WHERE bot_id=$3) FOR UPDATE OF t`, [id, viewer.group_id,this.botId]);
+        WHERE o.id=$1 AND o.group_id=$2 AND t.active AND o.group_id IN (SELECT id FROM task_groups WHERE bot_id=$3) FOR UPDATE OF t`, [id, viewer.group_id,this.botId]);
     }
     const occurrence = (await this.db.query<Occurrence>(`SELECT ${dateColumns} FROM occurrences o JOIN tasks t ON t.id=o.task_id
-      WHERE o.id=$1 AND o.group_id=$2 AND o.group_id IN (SELECT id FROM task_groups WHERE bot_id=$3) ${lock ? 'FOR UPDATE OF o' : ''}`, [id, viewer.group_id,this.botId])).rows[0];
+      WHERE o.id=$1 AND o.group_id=$2 AND t.active AND o.group_id IN (SELECT id FROM task_groups WHERE bot_id=$3) ${lock ? 'FOR UPDATE OF o' : ''}`, [id, viewer.group_id,this.botId])).rows[0];
     if (!occurrence) throw new UserError('Задача не найдена в твоей группе.');
     return occurrence;
+  }
+  async deleteTask(admin: Member, occurrenceId: number) {
+    this.admin(admin);
+    const task = await this.occurrence(admin,occurrenceId,true);
+    await this.db.query('UPDATE tasks SET active=false,next_on=NULL WHERE id=$1',[task.task_id]);
+    const occurrences = (await this.db.query<{ id: number }>('SELECT id FROM occurrences WHERE task_id=$1 ORDER BY id FOR UPDATE',[task.task_id])).rows;
+    for (const occurrence of occurrences) await this.closeHelp(occurrence.id);
+    return task.assignee_id;
   }
   async event(id: number, actor: number, kind: string, details: Record<string, unknown> = {}) {
     await this.db.query('INSERT INTO events (occurrence_id,actor_id,kind,details) VALUES ($1,$2,$3,$4)', [id, actor, kind, JSON.stringify(details)]);
@@ -247,6 +255,13 @@ export class Service {
       JOIN occurrences o ON o.id=e.occurrence_id JOIN tasks t ON t.id=o.task_id
       WHERE o.group_id=$1 AND e.created_at >= $2 AND o.group_id IN (SELECT id FROM task_groups WHERE bot_id=$3) ORDER BY e.id DESC LIMIT 20`, [viewer.group_id, new Date(this.now.getTime() - 7 * 86400_000),this.botId])).rows;
   }
+  async reminderText(member: Member, day: string) {
+    this.assertMember(member);
+    const tasks = (await this.db.query<{ title: string; due_on: string; schedule: Schedule }>(`SELECT t.title,o.due_on::text,t.schedule FROM occurrences o JOIN tasks t ON t.id=o.task_id
+      WHERE o.assignee_id=$1 AND o.group_id=$2 AND t.active AND o.completed_at IS NULL AND o.due_on<=$3 ORDER BY o.due_on,o.id`,[member.id,member.group_id,day])).rows
+      .filter(task => shouldRemind(task.schedule,task.due_on,day));
+    return tasks.length ? `📋 Твои невыполненные задачи (${tasks.length}):\n${tasks.slice(0,15).map(t => `• ${t.title} — ${t.due_on}`).join('\n')}\n\nОткрыть список: /tasks` : undefined;
+  }
   async reminders() {
     const groups = (await this.db.query<{ id: number; timezone: string }>('SELECT id,timezone FROM task_groups WHERE bot_id=$1 ORDER BY id',[this.botId])).rows;
     for (const group of groups) {
@@ -254,10 +269,8 @@ export class Service {
       const day = localDay(this.now, group.timezone);
       const members = (await this.db.query<Member>(`SELECT m.*,u.profile_name AS name FROM members m JOIN app_users u USING (bot_id,telegram_id) WHERE group_id=$1 AND m.bot_id=$2`, [group.id,this.botId])).rows;
       for (const member of members) {
-        const tasks = (await this.db.query<{ title: string; due_on: string; schedule: Schedule }>(`SELECT t.title,o.due_on::text,t.schedule FROM occurrences o JOIN tasks t ON t.id=o.task_id
-          WHERE o.assignee_id=$1 AND o.completed_at IS NULL AND o.due_on<=$2 ORDER BY o.due_on,o.id`, [member.id, day])).rows
-          .filter(task => shouldRemind(task.schedule, task.due_on, day));
-        if (tasks.length) await this.send(member.telegram_id, `📋 Твои невыполненные задачи (${tasks.length}):\n${tasks.slice(0,15).map(t => `• ${t.title} — ${t.due_on}`).join('\n')}\n\nОткрыть список: /tasks`, undefined, `reminder:${member.id}:${day}`);
+        const text = await this.reminderText(member,day);
+        if (text) await this.send(member.telegram_id,text,undefined,`reminder:${member.id}:${day}`);
       }
     }
   }

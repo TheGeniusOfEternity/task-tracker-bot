@@ -730,6 +730,79 @@ test('task lists and descriptions use colored status markers without the extra s
   }
 });
 
+test('admin deletion requires confirmation and cancellation leaves the task active', async () => {
+  const t = await occurrence();
+  await update(callback(1800,`task:${t.id}`));
+  const card = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1800:0'")).rows[0]!.payload;
+  assert.ok(card.reply_markup.inline_keyboard.flat().some((b: { callback_data: string }) => b.callback_data === `deletetask:${t.id}`));
+  await update(callback(1801,`deletetask:${t.id}`));
+  assert.equal((await store.query('SELECT active FROM tasks WHERE id=$1',[t.task_id])).rows[0]!.active,true);
+  const confirmation = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1801:0'")).rows[0]!.payload;
+  assert.match(confirmation.text,/Все её повторения/);
+  await update(callback(1802,`task:${t.id}`));
+  await update(callback(1803,'confirmdelete'));
+  assert.equal((await store.query('SELECT active FROM tasks WHERE id=$1',[t.task_id])).rows[0]!.active,true);
+  await update(callback(1804,`deletetask:${t.id}`)); await update(callback(1805,'confirmdelete'));
+  await update(callback(1806,'confirmdelete'));
+  assert.equal((await store.query('SELECT active,next_on FROM tasks WHERE id=$1',[t.task_id])).rows[0]!.active,false);
+  assert.equal((await run(s => s.tasks(a,a.id))).length,0);
+  assert.equal(await run(s => s.session('101')),undefined);
+});
+
+test('deleting a series retains completion history, closes all help and rejects old actions', async () => {
+  const t = await occurrence('daily');
+  await run(s => s.complete(a,t.id));
+  const open = (await run(s => s.tasks(a,a.id))).slice(0,2);
+  const helpIds: number[] = [];
+  for (const task of open) helpIds.push(await run(s => s.requestHelp(a,task.id,[b.id])));
+  await flushOutbox(store,async () => ({ message_id: 999 }));
+  const before = (await store.query('SELECT id FROM occurrences WHERE task_id=$1',[t.task_id])).rows.length;
+  await run(s => s.deleteTask(a,open[0]!.id));
+  assert.equal((await store.query('SELECT id FROM occurrences WHERE task_id=$1',[t.task_id])).rows.length,before);
+  assert.equal((await run(s => s.history(a))).some(e => e.kind === 'completed'),true);
+  assert.equal((await store.query("SELECT id FROM help_requests WHERE state='pending'")).rows.length,0);
+  assert.equal((await store.query("SELECT id FROM outbox WHERE method='editMessageReplyMarkup'")).rows.length,2);
+  await assert.rejects(run(s => s.complete(a,t.id,true)),UserError);
+  await assert.rejects(run(s => s.requestHelp(a,open[0]!.id,[b.id])),UserError);
+  await assert.rejects(run(s => s.acceptHelp(b,helpIds[0]!)),UserError);
+  await runAt('2027-02-01',s => s.materialize(a.group_id));
+  assert.equal((await store.query('SELECT id FROM occurrences WHERE task_id=$1',[t.task_id])).rows.length,before);
+  assert.equal((await run(s => s.tasks(a,a.id))).length,0);
+});
+
+test('task deletion is restricted to an administrator of the same group and bot', async () => {
+  const t = await occurrence();
+  await update(callback(1820,`task:${t.id}`,102));
+  const card = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1820:0'")).rows[0]!.payload;
+  assert.equal(card.reply_markup.inline_keyboard.flat().some((b: { callback_data: string }) => b.callback_data.startsWith('deletetask:')),false);
+  await update(callback(1821,`deletetask:${t.id}`,102));
+  assert.equal((await store.query("SELECT payload FROM outbox WHERE dedupe_key='error:1821:0'")).rows[0]!.payload.show_alert,true);
+  await assert.rejects(run(s => s.deleteTask(b,t.id)),UserError);
+  await assert.rejects(run(s => s.deleteTask(outsider,t.id)),UserError);
+  const other = await otherBot();
+  await assert.rejects(runFor('work',s => s.deleteTask(other.admin,t.id)),UserError);
+  assert.equal((await store.query('SELECT active FROM tasks WHERE id=$1',[t.task_id])).rows[0]!.active,true);
+});
+
+test('delivery excludes deleted tasks from queued assignments, help and aggregate reminders', async () => {
+  const t = await occurrence();
+  await run(s => s.createTask(a,'Сохранённая задача',a.id,{ kind: 'once',start: '2026-11-08' }));
+  await run(s => s.requestHelp(a,t.id,[b.id]));
+  await run(s => s.reminders());
+  await run(s => s.deleteTask(a,t.id));
+  const delivered: string[] = [];
+  await flushOutbox(store,async (_method,payload) => { if (typeof payload.text === 'string') delivered.push(payload.text); return {}; });
+  assert.equal(delivered.some(text => text.includes(t.title)),false);
+  const reminder = delivered.find(text => text.includes('невыполненные задачи'))!;
+  assert.match(reminder,/задачи \(1\)/);
+  assert.match(reminder,/Сохранённая задача/);
+  assert.equal((await store.query("SELECT id FROM outbox WHERE state<>'sent'")).rows.length,0);
+  const remaining = (await run(s => s.tasks(a,a.id)))[0]!;
+  await run(s => s.deleteTask(a,remaining.id));
+  await runAt('2026-11-09',s => s.reminders());
+  assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'reminder:%:2026-11-09'")).rows.length,0);
+});
+
 test('a draft confirmed on a later day refreshes its automatic deadline before creation', async () => {
   const update = (value: Update) => processUpdate(store,value,{ ...options,now: new Date('2026-11-08T20:45:00Z') });
   await update(callback(1500,'new')); await update(message(1501,'Проверка полуночи'));

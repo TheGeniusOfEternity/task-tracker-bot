@@ -2,7 +2,7 @@ import type { Store } from './db.js';
 import { Service } from './service.js';
 
 export interface Delivery {
-  id: number; method: string; payload: Record<string, unknown>; attempts: number;
+  id: number; dedupe_key: string; method: string; payload: Record<string, unknown>; attempts: number;
   guard_help_id: number | null; recipient_id: number | null;
 }
 export class TelegramError extends Error {
@@ -25,7 +25,7 @@ export async function flushOutbox(store: Store, transport: Transport, botId = 'd
   const deadline = Date.now() + budgetMs;
   for (let i = 0; i < limit && Date.now() < deadline; i++) {
     const job = await store.transaction(async db => {
-      const selected = (await db.query<Delivery>(`SELECT id,method,payload,attempts,guard_help_id,recipient_id FROM outbox
+      const selected = (await db.query<Delivery>(`SELECT id,dedupe_key,method,payload,attempts,guard_help_id,recipient_id FROM outbox
         WHERE bot_id=$1 AND ((state='pending' AND available_at<=now()) OR (state='sending' AND lease_until<now()))
         ORDER BY (method='answerCallbackQuery') DESC,id FOR UPDATE SKIP LOCKED LIMIT 1`,[botId])).rows[0];
       if (!selected) return;
@@ -37,6 +37,20 @@ export async function flushOutbox(store: Store, transport: Transport, botId = 'd
         const busy = await db.query(`SELECT id FROM outbox WHERE bot_id=$1 AND id<>$2 AND state='sending' AND lease_until>=now() AND method='editMessageText'
           AND payload->>'chat_id'=$3 AND payload->>'message_id'=$4 LIMIT 1`,[botId,selected.id,String(selected.payload.chat_id),String(selected.payload.message_id)]);
         if (busy.rows.length) return;
+      }
+      // Recheck notifications at delivery, including jobs queued before a task was deleted.
+      const created = /^task-created:(\d+)$/.exec(selected.dedupe_key);
+      const reminder = /^reminder:(\d+):(\d{4}-\d{2}-\d{2})$/.exec(selected.dedupe_key);
+      if (selected.method === 'sendMessage' && created) {
+        const active = await db.query('SELECT t.id FROM tasks t JOIN task_groups g ON g.id=t.group_id WHERE t.id=$1 AND t.active AND g.bot_id=$2',[created[1],botId]);
+        if (!active.rows.length) { await db.query("UPDATE outbox SET state='sent',lease_until=NULL WHERE id=$1",[selected.id]); return { skip: true } as const; }
+      }
+      if (selected.method === 'sendMessage' && reminder) {
+        const s = new Service(db,`reminder-delivery:${selected.id}`,undefined,botId);
+        const member = await s.member(String(selected.payload.chat_id));
+        const text = member && String(member.id) === reminder[1] ? await s.reminderText(member,reminder[2]!) : undefined;
+        if (!text) { await db.query("UPDATE outbox SET state='sent',lease_until=NULL WHERE id=$1",[selected.id]); return { skip: true } as const; }
+        selected.payload = { ...selected.payload,text };
       }
       if (selected.guard_help_id) {
         const state = (await db.query<{ state: string }>('SELECT state FROM help_requests WHERE id=$1', [selected.guard_help_id])).rows[0]?.state;
