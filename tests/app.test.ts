@@ -697,7 +697,7 @@ test('task card offers either request help or cancel help and updates immediatel
   let id = 1600;
   const cb = (data: string) => update(callback(id++,data));
   const card = async () => (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
-  const actions = (payload: { reply_markup: { inline_keyboard: { callback_data: string }[][] } }) => payload.reply_markup.inline_keyboard.flat().map((b: { callback_data: string }) => b.callback_data);
+  const actions = (payload: { reply_markup: { inline_keyboard: { callback_data: string }[][] } }) => payload.reply_markup.inline_keyboard.flat().map((b: { callback_data: string }) => b.callback_data.split(':').slice(0,2).join(':'));
   await cb(`task:${t.id}`);
   assert.ok(actions(await card()).includes(`help:${t.id}`));
   assert.equal(actions(await card()).includes(`cancelhelp:${t.id}`),false);
@@ -722,9 +722,9 @@ test('task lists and descriptions use colored status markers without the extra s
   for (const [day,title] of [['2026-11-07','Прошлая'],['2026-11-08','Сегодняшняя'],['2026-11-09','Будущая']]) {
     await run(s => s.createTask(a,title!,a.id,{ kind: 'once',start: day! }));
   }
-  await update(callback(1700,'mine'));
+  await update(callback(1700,`list:${a.id}:month:0`));
   const list = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1700:0'")).rows[0]!.payload;
-  assert.equal(list.text,'Задачи: Максим');
+  assert.equal(list.text,'Задачи: Максим · Ближайшие 30 дней');
   assert.deepEqual(list.reply_markup.inline_keyboard.slice(0,3).map((r: { text: string }[]) => r[0]!.text),[
     '🔴 Прошлая · 2026-11-07','🟡 Сегодняшняя · 2026-11-08','🔵 Будущая · 2026-11-09',
   ]);
@@ -740,7 +740,7 @@ test('admin deletion requires confirmation and cancellation leaves the task acti
   const t = await occurrence();
   await update(callback(1800,`task:${t.id}`));
   const card = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1800:0'")).rows[0]!.payload;
-  assert.ok(card.reply_markup.inline_keyboard.flat().some((b: { callback_data: string }) => b.callback_data === `deletetask:${t.id}`));
+  assert.ok(card.reply_markup.inline_keyboard.flat().some((b: { callback_data: string }) => b.callback_data === `deletetask:${t.id}:today:0`));
   await update(callback(1801,`deletetask:${t.id}`));
   assert.equal((await store.query('SELECT active FROM tasks WHERE id=$1',[t.task_id])).rows[0]!.active,true);
   const confirmation = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1801:0'")).rows[0]!.payload;
@@ -1004,6 +1004,9 @@ test('completing a daily task keeps the series and displays tomorrow with a blue
   let view = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
   assert.match(view.reply_markup.inline_keyboard[0][0].text,/^🟡 Ежедневная проверка · 2026-11-08$/);
   await cb(`done:${first.id}`); await cb('mine');
+  const todayView = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  assert.equal(todayView.reply_markup.inline_keyboard.flat().some((b: { callback_data: string }) => b.callback_data.startsWith('task:')),false);
+  await cb(`list:${b.id}:week:0`);
   view = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
   assert.match(view.reply_markup.inline_keyboard[0][0].text,/^🔵 Ежедневная проверка · 2026-11-09$/);
   assert.equal((await store.query('SELECT active FROM tasks WHERE id=$1',[task.id])).rows[0]!.active,true);
@@ -1044,6 +1047,64 @@ test('future previews follow leap days and skip missed dates after late completi
   const next = (await runAt('2028-03-04',s => s.tasks(a,a.id)))[0]!;
   assert.equal(next.due_on,'2028-03-05');
   assert.equal((await store.query('SELECT id FROM occurrences WHERE task_id=$1 AND completed_at IS NULL',[taskId])).rows.length,1);
+});
+
+test('task modes default to today and include overdue tasks within inclusive 7 and 30 day horizons', async () => {
+  for (const [day,title] of [['2026-11-07','Просроченная'],['2026-11-08','Сегодня'],['2026-11-09','Завтра'],['2026-11-14','Седьмой день'],['2026-11-15','Восьмой день'],['2026-12-07','Тридцатый день'],['2026-12-08','За пределами']]) {
+    await run(s => s.createTask(b,title!,b.id,{ kind: 'once',start: day! }));
+  }
+  await run(s => s.createTask(a,'Другой исполнитель',a.id,{ kind: 'once',start: '2026-11-08' }));
+  let id = 2400;
+  const view = async (data: string) => {
+    await update(callback(id++,data,102));
+    return (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  };
+  const taskLabels = (payload: { reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] } }) => payload.reply_markup.inline_keyboard.flat().filter(b => b.callback_data.startsWith('task:')).map(b => b.text);
+  const today = await view('mine');
+  assert.deepEqual(taskLabels(today),['🔴 Просроченная · 2026-11-07','🟡 Сегодня · 2026-11-08']);
+  assert.deepEqual(today.reply_markup.inline_keyboard.at(-2).map((b: { text: string }) => b.text),['📅 На неделе','🗓 На месяце']);
+  const week = await view(`list:${b.id}:week:0`);
+  assert.equal(taskLabels(week).length,4); assert.ok(taskLabels(week).at(-1)!.includes('Седьмой день'));
+  assert.equal(week.reply_markup.inline_keyboard.at(-2)[0].text,'📍 Сегодня');
+  const month = await view(`list:${b.id}:month:0`);
+  assert.equal(taskLabels(month).length,6); assert.ok(taskLabels(month).at(-1)!.includes('Тридцатый день'));
+  assert.equal(month.reply_markup.inline_keyboard.at(-2)[0].text,'📍 Сегодня');
+  const legacy = await view(`list:${b.id}:0`);
+  assert.deepEqual(taskLabels(legacy),taskLabels(today));
+  await processUpdate(store,callback(id++,'mine',102),{ ...options,now: new Date('2026-11-08T21:10:00Z') });
+  const midnight = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  assert.ok(taskLabels(midnight).includes('🟡 Завтра · 2026-11-09'));
+});
+
+test('task modes paginate only beyond ten tasks and preserve mode and page through card actions', async () => {
+  let id = 2500;
+  const view = async (data: string) => {
+    await update(callback(id++,data,102));
+    return (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  };
+  const buttons = (payload: { reply_markup: { inline_keyboard: { text: string; callback_data: string }[][] } }) => payload.reply_markup.inline_keyboard.flat();
+  for (let index = 0; index < 10; index++) await run(s => s.createTask(b,`Проверка ${index}`,b.id,{ kind: 'once',start: '2026-11-08' }));
+  const ten = await view('mine');
+  assert.equal(buttons(ten).filter(b => b.callback_data.startsWith('task:')).length,10);
+  assert.equal(buttons(ten).some(b => b.text === '➡️ Дальше'),false);
+  await run(s => s.createTask(b,'Одиннадцатая',b.id,{ kind: 'once',start: '2026-11-08' }));
+  const eleven = await view('mine');
+  assert.equal(buttons(eleven).filter(b => b.callback_data.startsWith('task:')).length,10);
+  assert.ok(buttons(eleven).some(button => button.callback_data === `list:${b.id}:today:1`));
+  for (const mode of ['today','week','month']) {
+    const last = await view(`list:${b.id}:${mode}:1`);
+    const task = buttons(last).find(b => b.callback_data.startsWith('task:'))!;
+    const card = await view(task.callback_data);
+    assert.ok(buttons(card).some(button => button.callback_data === `list:${b.id}:${mode}:1`));
+    assert.ok(buttons(card).some(button => button.callback_data.endsWith(`:${mode}:1`) && button.callback_data.startsWith('done:')));
+  }
+  const card = await view(buttons(await view(`list:${b.id}:week:1`)).find(b => b.callback_data.startsWith('task:'))!.callback_data);
+  const done = await view(buttons(card).find(b => b.callback_data.startsWith('done:'))!.callback_data);
+  const back = buttons(done).find(b => b.callback_data.startsWith('list:'))!;
+  const remaining = await view(back.callback_data);
+  assert.match(remaining.text,/Ближайшие 7 дней/);
+  assert.equal(buttons(remaining).filter(b => b.callback_data.startsWith('task:')).length,10);
+  assert.equal(buttons(remaining).some(b => b.text === '➡️ Дальше'),false);
 });
 
 test('a draft confirmed on a later day refreshes its automatic deadline before creation', async () => {

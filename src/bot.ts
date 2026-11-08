@@ -94,30 +94,38 @@ function taskStatus(task: { due_on: string; completed_at: Date | null }, today: 
   if (task.due_on === today) return { icon: '🟡',text: 'На сегодня' };
   return { icon: '🔵',text: 'Предстоит' };
 }
-async function taskList(s: Service, viewer: Member, owner: number, page = 0) {
+type TaskMode = 'today' | 'week' | 'month';
+const taskMode = (value?: string): TaskMode => value === 'week' || value === 'month' ? value : 'today';
+const taskPage = (value?: string) => /^\d{1,5}$/.test(value ?? '') ? Math.min(10000,Number(value)) : 0;
+async function taskList(s: Service, viewer: Member, owner: number, page = 0, mode: TaskMode = 'today'): Promise<void> {
   const target = await s.target(viewer, owner);
-  const tasks = await s.tasks(viewer, owner, page);
   const today = await s.today(viewer);
-  const rows = tasks.slice(0, 5).map(t => [button(`${taskStatus(t,today).icon} ${t.title.slice(0, 45)} · ${t.due_on}`, `task:${t.id}`)]);
+  const tasks = await s.tasks(viewer,owner,page,addDays(today,mode === 'week' ? 6 : mode === 'month' ? 29 : 0));
+  if (!tasks.length && page > 0) return taskList(s,viewer,owner,0,mode);
+  const rows = tasks.slice(0, 10).map(t => [button(`${taskStatus(t,today).icon} ${t.title.slice(0, 45)} · ${t.due_on}`, `task:${t.id}:${mode}:${page}`)]);
   const nav = [];
-  if (page > 0) nav.push(button('⬅️ Назад', `list:${owner}:${page - 1}`));
-  if (tasks.length > 5) nav.push(button('➡️ Дальше', `list:${owner}:${page + 1}`));
+  if (page > 0) nav.push(button('⬅️ Назад', `list:${owner}:${mode}:${page - 1}`));
+  if (tasks.length > 10) nav.push(button('➡️ Дальше', `list:${owner}:${mode}:${page + 1}`));
   nav.push(button('🏠 Меню','menu'));
-  rows.push(nav);
-  await s.screen(viewer.telegram_id, `Задачи: ${target.name}${tasks.length ? '' : '\nОткрытых задач пока нет.'}`, keyboard(rows));
+  const filters = [];
+  if (mode !== 'today') filters.push(button('📍 Сегодня',`list:${owner}:today:0`));
+  if (mode !== 'week') filters.push(button('📅 На неделе',`list:${owner}:week:0`));
+  if (mode !== 'month') filters.push(button('🗓 На месяце',`list:${owner}:month:0`));
+  rows.push(filters,nav);
+  await s.screen(viewer.telegram_id, `Задачи: ${target.name} · ${{ today: 'Сегодня',week: 'Ближайшие 7 дней',month: 'Ближайшие 30 дней' }[mode]}${page || tasks.length > 10 ? ` · Страница ${page+1}` : ''}${tasks.length ? '' : '\nНа этот период открытых задач нет.'}`, keyboard(rows));
 }
-async function taskCard(s: Service, viewer: Member, occurrenceId: number) {
+async function taskCard(s: Service, viewer: Member, occurrenceId: number, mode: TaskMode = 'today', page = 0) {
   const t = await s.occurrence(viewer, occurrenceId);
   const rows = [];
   if (t.assignee_id === viewer.id) {
-    if (t.completed_at) rows.push([button('↩️ Отменить отметку', `undo:${t.id}`)]);
+    if (t.completed_at) rows.push([button('↩️ Отменить отметку', `undo:${t.id}:${mode}:${page}`)]);
     else {
-      if (!t.help_pending) rows.push([button('✅ Выполнено', `done:${t.id}`)]);
-      rows.push([t.help_pending ? button('🚫 Отменить просьбу о помощи',`cancelhelp:${t.id}`) : button('🙋 Попросить помощи',`help:${t.id}`)]);
+      if (!t.help_pending) rows.push([button('✅ Выполнено', `done:${t.id}:${mode}:${page}`)]);
+      rows.push([t.help_pending ? button('🚫 Отменить просьбу о помощи',`cancelhelp:${t.id}:${mode}:${page}`) : button('🙋 Попросить помощи',`help:${t.id}:${mode}:${page}`)]);
     }
   }
-  if (viewer.role === 'admin') rows.push([button('🗑 Удалить задачу',`deletetask:${t.id}`)]);
-  rows.push([button('⬅️ Назад', `list:${t.assignee_id}:0`),button('🏠 Меню','menu')]);
+  if (viewer.role === 'admin') rows.push([button('🗑 Удалить задачу',`deletetask:${t.id}:${mode}:${page}`)]);
+  rows.push([button('⬅️ Назад', `list:${t.assignee_id}:${mode}:${page}`),button('🏠 Меню','menu')]);
   const status = taskStatus(t,await s.today(viewer));
   await s.screen(viewer.telegram_id, `📋 ${t.title}\nСрок: ${t.due_on} (до конца дня, Москва)\nИсполнитель: ${await s.name(viewer, t.assignee_id)}\n${scheduleLabel(t.schedule)}${t.schedule.overdue === 'weekends' ? '\nПри просрочке: напоминания по субботам и воскресеньям, одна открытая задача.' : ''}\n${status.icon} ${status.text}`, keyboard(rows));
 }
@@ -284,7 +292,8 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
     bot.command('once', async () => newTask(s,await s.requireMember(uid)));
     bot.command('invite', async ctx => invite(s,await s.requireMember(uid),ctx.me.username));
     bot.on('callback_query:data', async ctx => {
-      const [action, arg, pageArg] = ctx.callbackQuery.data.split(':');
+      const [action,arg,pageArg,contextPage] = ctx.callbackQuery.data.split(':');
+      const mode = taskMode(pageArg), page = taskPage(contextPage);
       if (action === 'menu' || action === 'cancel') { await s.saveSession(uid); await main(s, uid); }
       else {
         const viewer = await s.requireMember(uid);
@@ -297,8 +306,8 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
           await s.screen(uid, `Как называть «${target.name}» для тебя? Введи удобное имя.${cancelHint}`);
         } else if (action === 'resetname') { await s.resetAlias(viewer, id(arg)); await memberCard(s, viewer, id(arg)); }
         else if (action === 'mine') await taskList(s, viewer, viewer.id);
-        else if (action === 'list') await taskList(s, viewer, id(arg), /^\d{1,5}$/.test(pageArg ?? '') ? Number(pageArg) : 0);
-        else if (action === 'task') await taskCard(s, viewer, id(arg));
+        else if (action === 'list') await taskList(s,viewer,id(arg),contextPage === undefined ? taskPage(pageArg) : page,mode);
+        else if (action === 'task') await taskCard(s,viewer,id(arg),mode,page);
         else if (action === 'admin') await adminPanel(s,viewer);
         else if (action === 'alltasks') await allTasks(s,viewer,/^\d{1,5}$/.test(arg ?? '') ? Math.min(10000,Number(arg)) : 0);
         else if (action === 'history') await history(s, viewer,/^\d$/.test(arg ?? '') ? Number(arg) : 0);
@@ -313,19 +322,19 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
         }
         else if (action === 'deletetask') {
           s.admin(viewer); const task = await s.occurrence(viewer,id(arg));
-          await s.saveSession(uid,{ step: 'delete_task',occurrence: task.id });
+          await s.saveSession(uid,{ step: 'delete_task',occurrence: task.id,listMode: mode,listPage: page });
           await s.screen(uid,`Удалить задачу «${task.title}»?\n\nВсе её повторения исчезнут из списков, напоминания и просьбы о помощи прекратятся. Журнал выполнений сохранится.`,keyboard([
-            [button('⬅️ Отмена',`task:${task.id}`),button('🗑 Удалить','confirmdelete')],
+            [button('⬅️ Отмена',`task:${task.id}:${mode}:${page}`),button('🗑 Удалить','confirmdelete')],
           ]));
         } else if (action === 'confirmdelete') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session,'delete_task');
           const owner = await s.deleteTask(viewer,Number(session.occurrence));
-          await s.saveSession(uid); await taskList(s,viewer,owner);
-        } else if (action === 'done' || action === 'undo') { await s.complete(viewer, id(arg), action === 'undo'); await taskCard(s, viewer, id(arg)); }
+          await s.saveSession(uid); await taskList(s,viewer,owner,taskPage(String(session.listPage ?? 0)),taskMode(String(session.listMode ?? 'today')));
+        } else if (action === 'done' || action === 'undo') { await s.complete(viewer, id(arg), action === 'undo'); await taskCard(s,viewer,id(arg),mode,page); }
         else if (action === 'help') {
           const task = await s.occurrence(viewer, id(arg));
           if (task.assignee_id !== viewer.id || task.completed_at) throw new UserError('Попросить помощи можно только со своей невыполненной задачей.');
-          const session = { step: 'help_pick', occurrence: task.id, selected: [] as number[] };
+          const session = { step: 'help_pick', occurrence: task.id, selected: [] as number[],listMode: mode,listPage: page };
           await s.saveSession(uid, session); await helpPicker(s, viewer, session);
         } else if (action === 'pickhelp') {
           const session = await s.session(uid); requireStep(session, 'help_pick');
@@ -337,11 +346,11 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
         } else if (action === 'sendhelp') {
           const session = await s.session(uid); requireStep(session, 'help_pick');
           await s.requestHelp(viewer, Number(session.occurrence), session.selected as number[]);
-          await s.saveSession(uid); await taskCard(s,viewer,Number(session.occurrence));
+          await s.saveSession(uid); await taskCard(s,viewer,Number(session.occurrence),taskMode(String(session.listMode ?? 'today')),taskPage(String(session.listPage ?? 0)));
         } else if (action === 'accept') {
           const taskId = await s.acceptHelp(viewer, id(arg));
           await s.screen(uid, 'Задача теперь твоя. Напоминания тоже будут приходить тебе.'); await taskCard(s, viewer, taskId);
-        } else if (action === 'cancelhelp') { await s.cancelHelp(viewer, id(arg)); await taskCard(s,viewer,id(arg)); }
+        } else if (action === 'cancelhelp') { await s.cancelHelp(viewer, id(arg)); await taskCard(s,viewer,id(arg),mode,page); }
         else if (action === 'owner') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_owner');
           const target = await s.target(viewer, id(arg));

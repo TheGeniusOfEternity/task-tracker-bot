@@ -166,12 +166,12 @@ export class Service {
       await this.db.query('UPDATE tasks SET next_on=$1 WHERE id=$2', [day, task.id]);
     }
   }
-  async tasks(viewer: Member, ownerId: number, page = 0) {
+  async tasks(viewer: Member, ownerId: number, page = 0, through?: string) {
     await this.target(viewer, ownerId);
     await this.materialize(viewer.group_id);
     return (await this.db.query<Occurrence>(`SELECT ${dateColumns} FROM occurrences o JOIN tasks t ON t.id=o.task_id
-      WHERE o.group_id=$1 AND o.assignee_id=$2 AND o.completed_at IS NULL AND t.active
-      ORDER BY o.due_on,o.id LIMIT 6 OFFSET $3`, [viewer.group_id, ownerId, Math.max(0, Math.min(10000, page)) * 5])).rows;
+      WHERE o.group_id=$1 AND o.assignee_id=$2 AND o.completed_at IS NULL AND t.active AND ($4::date IS NULL OR o.due_on<=$4)
+      ORDER BY o.due_on,o.id LIMIT 11 OFFSET $3`, [viewer.group_id, ownerId, Math.max(0, Math.min(10000, page)) * 10,through ?? null])).rows;
   }
   async occurrence(viewer: Member, id: number, lock = false): Promise<Occurrence> {
     this.assertMember(viewer);
