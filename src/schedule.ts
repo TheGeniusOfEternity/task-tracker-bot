@@ -3,12 +3,13 @@ export type Schedule = {
   weekdays?: number[]; weekday?: number; ordinal?: number; overdue?: 'daily' | 'weekends';
 };
 export const weekdayNames = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'];
+export const weekdayShortNames = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
 export const ordinalNames: Record<number, string> = { 1: '1-й', 2: '2-й', 3: '3-й', 4: '4-й', [-1]: 'последний' };
 export const ordinalPlural: Record<number,string> = { 1: 'первые',2: 'вторые',3: 'третьи',4: 'четвёртые',[-1]: 'последние' };
 export function weekdaysLabel(days: number[] = []): string {
   const selected = [...new Set(days)].sort((a,b) => a - b);
   if (selected.length === 7) return 'Каждый день';
-  return selected.map(day => weekdayNames[day - 1]).join(', ');
+  return selected.map(day => weekdayShortNames[day - 1]).join(', ');
 }
 function monthlyDates(schedule: Schedule, year: number, month: number): string[] {
   const days = schedule.weekdays ?? [schedule.weekday ?? 0];
@@ -75,10 +76,10 @@ export function scheduleLabel(schedule: Schedule): string {
     const gender = [3,5,6].includes(weekday) ? 'f' : weekday === 7 ? 'n' : 'm';
     const ordinal = schedule.ordinal === -1 ? ({ f: 'последняя', n: 'последнее', m: 'последний' })[gender]
       : `${schedule.ordinal ?? 1}-${gender === 'f' ? 'я' : gender === 'n' ? 'е' : 'й'}`;
-    return `Каждый месяц: ${ordinal} ${weekdayNames[weekday - 1]}`;
+    return `Каждый месяц: ${ordinal} ${weekdayShortNames[weekday - 1]}`;
   }
   if (schedule.kind === 'weekly') return schedule.weekdays?.length === 7 ? 'Каждый день' : `Еженедельно: ${weekdaysLabel(schedule.weekdays)}`;
-  return ({ once: 'Разовая', daily: 'Каждый день', monthly: 'Ежемесячно' })[schedule.kind];
+  return ({ once: 'Без повтора', daily: 'Каждый день', monthly: 'Ежемесячно' })[schedule.kind];
 }
 export function shouldRemind(schedule: Schedule, due: string, day: string): boolean {
   if (day < due) return false;

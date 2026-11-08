@@ -578,7 +578,9 @@ test('weekday checkbox selection toggles in place and rejects an empty selection
   assert.deepEqual((await run(s => s.session('101')))?.weekdays,[1]);
   const first = (await store.query("SELECT method,payload FROM outbox WHERE dedupe_key='update:1204:0'")).rows[0]!;
   assert.equal(first.method,'editMessageText');
-  assert.match(first.payload.reply_markup.inline_keyboard[0][0].text,/✅/);
+  assert.equal(first.payload.reply_markup.inline_keyboard[0][0].text,'✅ Пн');
+  assert.doesNotMatch(first.payload.text,/Шаг/);
+  assert.deepEqual(first.payload.reply_markup.inline_keyboard.at(-1).map((b: { callback_data: string }) => b.callback_data),['menu','taskdaysdone']);
   assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'update:1204:%' AND method='sendMessage'")).rows.length,0);
   await update(callback(1205,'taskday:1'));
   assert.deepEqual((await run(s => s.session('101')))?.weekdays,[]);
@@ -587,7 +589,9 @@ test('weekday checkbox selection toggles in place and rejects an empty selection
   assert.match(all.text,/Выбрано: Каждый день/);
   await update(callback(1207,'taskdaysdone'));
   const periods = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1207:0'")).rows[0]!.payload;
-  assert.deepEqual(periods.reply_markup.inline_keyboard.slice(0,2).map((row: { callback_data: string }[]) => row[0]!.callback_data),['period:weekly','period:monthly']);
+  assert.deepEqual(periods.reply_markup.inline_keyboard.slice(0,3).map((row: { callback_data: string }[]) => row[0]!.callback_data),['period:once','period:weekly','period:monthly']);
+  assert.doesNotMatch(periods.text,/Шаг/);
+  assert.deepEqual(periods.reply_markup.inline_keyboard.at(-1).map((b: { callback_data: string }) => b.callback_data),['backdays','menu']);
   await update(callback(1208,'backdays'));
   assert.deepEqual((await run(s => s.session('101')))?.weekdays,[1,2,3,4,5,6,7]);
   await update(callback(1209,'taskdaysdone')); await update(callback(1210,'period:weekly'));
@@ -603,21 +607,28 @@ test('monthly recurrence supports multiple checked weekdays within the same mont
   assert.equal(nextDue(monthly,'2026-11-04'),'2026-11-07');
   assert.equal(nextDue(monthly,'2026-11-07'),'2026-12-02');
   assert.equal(firstDue({ ...monthly,start: '2026-11-03' }),'2026-11-04');
-  assert.match(scheduleLabel(monthly),/первые: понедельник, среда, суббота/);
+  assert.match(scheduleLabel(monthly),/первые: Пн, Ср, Сб/);
   const all: Schedule = { ...monthly,weekdays: [1,2,3,4,5,6,7] };
   assert.equal(firstDue(all),'2026-11-01');
   assert.equal(nextDue(all,'2026-11-07'),'2026-12-01');
   assert.match(scheduleLabel(all),/каждый день, 1–7/);
   assert.equal(firstDue({ ...all,start: '2028-02-01',ordinal: -1 }),'2028-02-23');
-  assert.equal(weekdaysLabel([7,3]),'среда, воскресенье');
+  assert.equal(weekdaysLabel([7,3]),'Ср, Вс');
 });
 
-test('one-off task creation remains available without weekday and period selection', async () => {
-  await update(callback(1220,'newonce')); await update(message(1221,'Разовая проверка'));
+test('one-off tasks use the shared creation flow and selected deadline', async () => {
+  await update(callback(1220,'new')); await update(message(1221,'Разовая проверка'));
   await update(callback(1222,`owner:${b.id}`));
+  assert.equal((await run(s => s.session('101')))?.step,'task_days');
+  await update(callback(1226,'taskday:1'));
+  await update(callback(1227,'taskdaysdone'));
+  await update(callback(1228,'period:once'));
   assert.equal((await run(s => s.session('101')))?.step,'task_date');
   await update(message(1223,'2026-11-08')); await update(callback(1224,'overdue:daily')); await update(callback(1225,'createtask'));
-  assert.equal((await store.query('SELECT schedule FROM tasks')).rows[0]!.schedule.kind,'once');
+  const schedule = (await store.query('SELECT schedule FROM tasks')).rows[0]!.schedule;
+  assert.equal(schedule.kind,'once');
+  assert.equal(schedule.weekdays,undefined);
+  assert.equal(firstDue(schedule),'2026-11-08');
   assert.equal((await store.query('SELECT id FROM occurrences')).rows.length,1);
 });
 

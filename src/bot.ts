@@ -2,7 +2,7 @@ import { Bot, BotError, InlineKeyboard } from 'grammy';
 import type { Update, UserFromGetMe } from 'grammy/types';
 import type { Store } from './db.js';
 import { Service, type Member, type Session } from './service.js';
-import { firstDue, ordinalPlural, scheduleLabel, validDay, weekdayNames, weekdaysLabel, type Schedule } from './schedule.js';
+import { firstDue, ordinalPlural, scheduleLabel, validDay, weekdayShortNames, weekdaysLabel, type Schedule } from './schedule.js';
 import { UserError } from './security.js';
 
 export interface BotOptions { token: string; adminIds: string[]; botInfo: UserFromGetMe; now?: Date; botId?: string }
@@ -14,7 +14,7 @@ function navigationKeyboard(member?: Member) {
   const result = new InlineKeyboard();
   if (member) {
     result.text('📋 Мои задачи','mine').row().text('👥 Группа','group').row().text('📖 Журнал','history');
-    if (member.role === 'admin') result.row().text('➕ Создать задачу','new').row().text('Разовая задача','newonce').row().text('🔗 Приглашение','invite');
+    if (member.role === 'admin') result.row().text('➕ Создать задачу','new').row().text('🔗 Приглашение','invite');
   } else result.text('← Меню','menu');
   return result;
 }
@@ -46,7 +46,7 @@ async function memberCard(s: Service, viewer: Member, targetId: number) {
   const target = await s.target(viewer, targetId);
   await s.screen(viewer.telegram_id, `${target.name}\n${target.role === 'admin' ? 'Администратор' : 'Участник'}\nНазвания участников настраиваются лично для тебя.`,
     keyboard([[button('📋 Задачи', `list:${targetId}:0`)], [button('✏️ Назвать для себя', `rename:${targetId}`)],
-      [button('Вернуть имя Telegram', `resetname:${targetId}`)], [button('← Группа', 'group')]]));
+      [button('Вернуть имя Telegram', `resetname:${targetId}`)], [button('← Группа', 'group'),button('← Меню','menu')]]));
 }
 async function taskList(s: Service, viewer: Member, owner: number, page = 0) {
   const target = await s.target(viewer, owner);
@@ -56,8 +56,8 @@ async function taskList(s: Service, viewer: Member, owner: number, page = 0) {
   const nav = [];
   if (page > 0) nav.push(button('← Назад', `list:${owner}:${page - 1}`));
   if (tasks.length > 5) nav.push(button('Дальше →', `list:${owner}:${page + 1}`));
-  if (nav.length) rows.push(nav);
-  rows.push([button('← Меню', 'menu')]);
+  nav.push(button('← Меню','menu'));
+  rows.push(nav);
   await s.screen(viewer.telegram_id, `Задачи: ${target.name}\n${tasks.length ? 'Открытые задачи, ближайшие и просроченные:' : 'Открытых задач пока нет.'}`, keyboard(rows));
 }
 async function taskCard(s: Service, viewer: Member, occurrenceId: number) {
@@ -71,7 +71,7 @@ async function taskCard(s: Service, viewer: Member, occurrenceId: number) {
       rows.push([button('Отменить просьбу о помощи', `cancelhelp:${t.id}`)]);
     }
   }
-  rows.push([button('← Задачи исполнителя', `list:${t.assignee_id}:0`)]);
+  rows.push([button('← Задачи исполнителя', `list:${t.assignee_id}:0`),button('← Меню','menu')]);
   await s.screen(viewer.telegram_id, `📋 ${t.title}\nСрок: ${t.due_on} (до конца дня, Москва)\nИсполнитель: ${await s.name(viewer, t.assignee_id)}\n${scheduleLabel(t.schedule)}${t.schedule.overdue === 'weekends' ? '\nПри просрочке: напоминания по субботам и воскресеньям, одна открытая задача.' : ''}\n${t.completed_at ? '✅ Выполнено' : 'Ожидает выполнения'}`, keyboard(rows));
 }
 async function history(s: Service, viewer: Member, page = 0) {
@@ -85,8 +85,9 @@ async function history(s: Service, viewer: Member, page = 0) {
   const nav = [];
   if (currentPage > 0) nav.push(button('← Назад',`history:${currentPage - 1}`));
   if (events.length > (currentPage + 1) * 6) nav.push(button('Дальше →',`history:${currentPage + 1}`));
+  nav.push(button('← Меню','menu'));
   await s.screen(viewer.telegram_id, lines.length ? `📖 События за 7 дней · страница ${currentPage + 1}\n\n${lines.join('\n\n')}` : 'За последние 7 дней событий пока нет.',
-    keyboard([...(nav.length ? [nav] : []),[button('← Меню', 'menu')]]));
+    keyboard([nav]));
 }
 async function helpPicker(s: Service, viewer: Member, session: Session) {
   const targets = (await s.members(viewer)).filter(m => m.id !== viewer.id);
@@ -94,21 +95,28 @@ async function helpPicker(s: Service, viewer: Member, session: Session) {
   const selected = session.selected as number[];
   await s.screen(viewer.telegram_id, 'Кого попросить? Отметь участников, затем нажми «Отправить».\nЗадача перейдёт первому согласившемуся.',
     keyboard([...targets.map(m => [button(`${selected.includes(m.id) ? '✅ ' : ''}${m.name}`, `pickhelp:${m.id}`)]),
-      [button(`Отправить (${selected.length})`, 'sendhelp')], [button('Отмена', 'cancel')]]));
+      [button('Отмена','cancel'),button(`Отправить (${selected.length})`, 'sendhelp')]]));
 }
-async function newTask(s: Service, viewer: Member, once = false) {
+async function newTask(s: Service, viewer: Member) {
   s.admin(viewer);
-  await s.saveSession(viewer.telegram_id, { step: 'task_title',...(once ? { kind: 'once' } : {}) });
+  await s.saveSession(viewer.telegram_id, { step: 'task_title' });
   await s.screen(viewer.telegram_id, `Как называется задача? До 160 символов.${cancelHint}`);
 }
 async function daysPicker(s: Service, viewer: Member, session: Session, messageId?: number) {
   const selected = session.weekdays as number[];
   await s.saveSession(viewer.telegram_id,{ ...session,step: 'task_days' });
-  const days = weekdayNames.map((name,index) => button(`${selected.includes(index + 1) ? '✅' : '⬜️'} ${name}`,`taskday:${index + 1}`));
-  const text = `Шаг 1 из 2 · Дни недели\n\nОтметь нужные дни и нажми «Готово».\nВыбрано: ${selected.length ? weekdaysLabel(selected) : 'пока ничего'}`;
-  const markup = keyboard([days.slice(0,2),days.slice(2,4),days.slice(4,6),days.slice(6),[button(selected.length === 7 ? 'Снять все' : 'Каждый день','taskdaysall')],[button('Готово','taskdaysdone')],[button('← Меню','menu')]]);
+  const days = weekdayShortNames.map((name,index) => button(`${selected.includes(index + 1) ? '✅' : '⬜️'} ${name}`,`taskday:${index + 1}`));
+  const text = `Отметь нужные дни и нажми «Готово».\nВыбрано: ${selected.length ? weekdaysLabel(selected) : 'пока ничего'}`;
+  const markup = keyboard([days.slice(0,4),days.slice(4),[button(selected.length === 7 ? 'Снять все' : 'Каждый день','taskdaysall')],[button('← Меню','menu'),button('Готово','taskdaysdone')]]);
   if (messageId) await s.enqueue('editMessageText',{ chat_id: viewer.telegram_id,message_id: messageId,text,reply_markup: markup });
   else await s.screen(viewer.telegram_id,text,markup);
+}
+async function periodPicker(s: Service, viewer: Member, session: Session) {
+  await s.saveSession(viewer.telegram_id,{ ...session,step: 'task_period' });
+  await s.screen(viewer.telegram_id,`Как часто повторять?\n\nДни: ${weekdaysLabel(session.weekdays as number[])}`,keyboard([
+    [button('Без повтора','period:once')],[button('Еженедельно','period:weekly')],[button('Ежемесячно','period:monthly')],
+    [button('← Дни недели','backdays'),button('← Меню','menu')],
+  ]));
 }
 async function askStart(s: Service, viewer: Member, session: Session) {
   await s.saveSession(viewer.telegram_id,{ ...session,step: 'task_date' });
@@ -151,7 +159,7 @@ async function textInput(s: Service, uid: string, text: string) {
 }
 function sessionSchedule(session: Session): Schedule {
   return { kind: session.kind as Schedule['kind'], start: session.start as string,
-    ...(session.weekdays ? { weekdays: session.weekdays as number[] } : {}),
+    ...(session.weekdays && session.kind !== 'once' ? { weekdays: session.weekdays as number[] } : {}),
     ...(session.weekday ? { weekday: Number(session.weekday) } : {}),
     ...(session.ordinal !== undefined ? { ordinal: Number(session.ordinal) } : {}),
     overdue: session.overdue as Schedule['overdue'] };
@@ -165,7 +173,7 @@ async function confirmTask(s: Service, viewer: Member, session: Session) {
   const schedule = sessionSchedule(session);
   await s.saveSession(viewer.telegram_id, { ...session, step: 'task_confirm' });
   await s.screen(viewer.telegram_id, `Создать задачу?\n\n${session.title}\nИсполнитель: ${await s.name(viewer, Number(session.owner))}\n${scheduleLabel(schedule)}\nПервый срок: ${firstDue(schedule)}\nСрок — до конца дня по Москве.${schedule.kind === 'monthly' ? '\nВ коротком месяце — последний день месяца.' : ''}\n${schedule.overdue === 'weekends' ? 'Просрочка: напоминания по выходным, одна задача до выполнения. После выполнения — ближайший будущий срок по календарю.' : 'Просрочка: ежедневные напоминания; повторения учитываются отдельно.'}`,
-    keyboard([[button('Создать', 'createtask')], [button('Отмена', 'cancel')]]));
+    keyboard([[button('Отмена','cancel'),button('Создать', 'createtask')]]));
 }
 
 export async function processUpdate(store: Store, update: Update, options: BotOptions) {
@@ -203,7 +211,7 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
     bot.command(['tasks', 'today'], async () => { const m = await s.requireMember(uid); await taskList(s, m, m.id); });
     bot.command('history', async () => history(s, await s.requireMember(uid)));
     bot.command('new', async () => newTask(s, await s.requireMember(uid)));
-    bot.command('once', async () => newTask(s,await s.requireMember(uid),true));
+    bot.command('once', async () => newTask(s,await s.requireMember(uid)));
     bot.command('invite', async ctx => invite(s,await s.requireMember(uid),ctx.me.username));
     bot.on('callback_query:data', async ctx => {
       const [action, arg, pageArg] = ctx.callbackQuery.data.split(':');
@@ -223,7 +231,7 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
         else if (action === 'task') await taskCard(s, viewer, id(arg));
         else if (action === 'history') await history(s, viewer,/^\d$/.test(arg ?? '') ? Number(arg) : 0);
         else if (action === 'new') await newTask(s, viewer);
-        else if (action === 'newonce') await newTask(s,viewer,true);
+        else if (action === 'newonce') await newTask(s,viewer);
         else if (action === 'invite') await invite(s,viewer,ctx.me.username);
         else if (action === 'done' || action === 'undo') { await s.complete(viewer, id(arg), action === 'undo'); await taskCard(s, viewer, id(arg)); }
         else if (action === 'help') {
@@ -250,17 +258,13 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_owner');
           const target = await s.target(viewer, id(arg));
           const next = { ...session,owner: target.id };
-          if (session.kind === 'once') await askStart(s,viewer,next);
-          else await daysPicker(s,viewer,{ ...next,weekdays: [] });
+          await daysPicker(s,viewer,{ ...next,weekdays: [] });
         } else if (action === 'taskday' || action === 'taskdaysall' || action === 'taskdaysdone') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_days');
           let selected = session.weekdays as number[];
           if (action === 'taskdaysdone') {
             if (!selected.length) throw new UserError('Выбери хотя бы один день недели.');
-            await s.saveSession(uid,{ ...session,step: 'task_period' });
-            await s.screen(uid,`Шаг 2 из 2 · Периодичность\n\nДни: ${weekdaysLabel(selected)}\nКак часто повторять?`,keyboard([
-              [button('Еженедельно','period:weekly')],[button('Ежемесячно','period:monthly')],[button('← Дни недели','backdays')],[button('← Меню','menu')],
-            ]));
+            await periodPicker(s,viewer,session);
           } else {
             if (action === 'taskdaysall') selected = selected.length === 7 ? [] : [1,2,3,4,5,6,7];
             else { const day = id(arg); if (day > 7) throw new UserError('Выбери день от понедельника до воскресенья.'); selected = selected.includes(day) ? selected.filter(x => x !== day) : [...selected,day]; }
@@ -268,15 +272,18 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
           }
         } else if (action === 'backdays') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_period'); await daysPicker(s,viewer,session);
+        } else if (action === 'backperiod') {
+          s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_ordinal'); await periodPicker(s,viewer,session);
         } else if (action === 'period') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_period');
-          if (arg === 'weekly') await askStart(s,viewer,{ ...session,kind: (session.weekdays as number[]).length === 7 ? 'daily' : 'weekly' });
+          if (arg === 'once') await askStart(s,viewer,{ ...session,kind: 'once' });
+          else if (arg === 'weekly') await askStart(s,viewer,{ ...session,kind: (session.weekdays as number[]).length === 7 ? 'daily' : 'weekly' });
           else if (arg === 'monthly') {
             await s.saveSession(uid,{ ...session,kind: 'monthly_weekday',step: 'task_ordinal' });
-            await s.screen(uid,`Ежемесячно · ${weekdaysLabel(session.weekdays as number[])}\n\nКакие по счёту выбранные дни месяца?\nНапример: первые понедельник и суббота месяца.`,keyboard([
-              ...[1,2,3,4,-1].map(n => [button(ordinalPlural[n]!, `ordinal:${n}`)]),[button('← Меню','menu')],
+            await s.screen(uid,`Ежемесячно · ${weekdaysLabel(session.weekdays as number[])}\n\nКакие по счёту выбранные дни месяца?\nНапример: первые Пн и Сб месяца.`,keyboard([
+              ...[1,2,3,4,-1].map(n => [button(ordinalPlural[n]!, `ordinal:${n}`)]),[button('← Назад','backperiod'),button('← Меню','menu')],
             ]));
-          } else throw new UserError('Выбери еженедельный или ежемесячный повтор.');
+          } else throw new UserError('Выбери «Без повтора», «Еженедельно» или «Ежемесячно».');
         } else if (action === 'kind') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_kind');
           await daysPicker(s,viewer,{ ...session,weekdays: [] });
