@@ -1,15 +1,15 @@
 import { randomBytes } from 'node:crypto';
 import type { Database } from './db.js';
-import { addDays, firstDue, localDay, nextDue, type Schedule } from './schedule.js';
+import { addDays, firstDue, localDay, nextDue, shouldRemind, type Schedule } from './schedule.js';
 import { hashCode, UserError } from './security.js';
 
 export interface Member { id: number; group_id: number; telegram_id: string; role: 'admin' | 'member'; name: string }
 export interface Occurrence {
   id: number; task_id: number; group_id: number; title: string; due_on: string;
-  original_owner_id: number; assignee_id: number; completed_by: number | null; completed_at: Date | null;
+  original_owner_id: number; assignee_id: number; completed_by: number | null; completed_at: Date | null; schedule: Schedule;
 }
 export type Session = { step: string; [key: string]: unknown };
-const dateColumns = `o.id, o.task_id, o.group_id, t.title, o.due_on::text, o.original_owner_id, o.assignee_id, o.completed_by, o.completed_at`;
+const dateColumns = `o.id, o.task_id, o.group_id, t.title, o.due_on::text, o.original_owner_id, o.assignee_id, o.completed_by, o.completed_at, t.schedule`;
 export class Service {
   private sequence = 0;
   constructor(readonly db: Database, readonly key: string, readonly now = new Date()) {}
@@ -93,8 +93,8 @@ export class Service {
     const task = (await this.db.query<{ id: number }>(`INSERT INTO tasks (group_id,title,owner_id,schedule,next_on)
       VALUES ($1,$2,$3,$4,$5) RETURNING id`, [admin.group_id, title.trim(), ownerId, JSON.stringify(schedule), nextDue(schedule, first)])).rows[0]!;
     // Always expose the first occurrence, even when its date is beyond the rolling horizon.
-    await this.db.query(`INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id)
-      VALUES ($1,$2,$3,$4,$4)`, [task.id, admin.group_id, first, ownerId]);
+    await this.db.query(`INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id,coalesced)
+      VALUES ($1,$2,$3,$4,$4,$5)`, [task.id, admin.group_id, first, ownerId, schedule.overdue === 'weekends']);
     await this.materialize(admin.group_id);
     const owner = await this.target(admin, ownerId);
     await this.send(owner.telegram_id, `📋 Тебе назначена задача: ${title.trim()}\nНачало: ${schedule.start}\nПосмотреть: /tasks`, undefined, `task-created:${task.id}`);
@@ -102,11 +102,26 @@ export class Service {
   }
   async materialize(groupId: number) {
     const group = (await this.db.query<{ timezone: string }>('SELECT timezone FROM task_groups WHERE id=$1', [groupId])).rows[0]!;
-    const through = addDays(localDay(this.now, group.timezone), 7);
+    const today = localDay(this.now, group.timezone);
+    const through = addDays(today, 7);
     const tasks = (await this.db.query<{ id: number; owner_id: number; schedule: Schedule; next_on: string }>(
       `SELECT id,owner_id,schedule,next_on::text FROM tasks WHERE group_id=$1 AND active AND next_on<=$2 ORDER BY id FOR UPDATE`, [groupId, through])).rows;
     for (const task of tasks) {
       let day: string | null = task.next_on;
+      if (task.schedule.overdue === 'weekends') {
+        let pending = (await this.db.query('SELECT id FROM occurrences WHERE task_id=$1 AND completed_at IS NULL', [task.id])).rows.length > 0;
+        // Only due cycles can open. Missed cycles advance the calendar, never duplicate the pending task.
+        for (let i = 0; day && day <= today && i < 500; i++) {
+          if (!pending) {
+            await this.db.query(`INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id,coalesced)
+              VALUES ($1,$2,$3,$4,$4,true) ON CONFLICT DO NOTHING`, [task.id, groupId, day, task.owner_id]);
+            pending = true;
+          }
+          day = nextDue(task.schedule, day);
+        }
+        await this.db.query('UPDATE tasks SET next_on=$1 WHERE id=$2', [day, task.id]);
+        continue;
+      }
       for (let i = 0; day && day <= through && i < 500; i++) {
         await this.db.query(`INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id)
           VALUES ($1,$2,$3,$4,$4) ON CONFLICT (task_id,due_on) DO NOTHING`, [task.id, groupId, day, task.owner_id]);
@@ -123,6 +138,11 @@ export class Service {
       ORDER BY o.due_on,o.id LIMIT 6 OFFSET $3`, [viewer.group_id, ownerId, Math.max(0, Math.min(10000, page)) * 5])).rows;
   }
   async occurrence(viewer: Member, id: number, lock = false): Promise<Occurrence> {
+    if (lock) {
+      // Match materialize's lock order: template first, occurrence second.
+      await this.db.query(`SELECT t.id FROM tasks t JOIN occurrences o ON o.task_id=t.id
+        WHERE o.id=$1 AND o.group_id=$2 FOR UPDATE OF t`, [id, viewer.group_id]);
+    }
     const occurrence = (await this.db.query<Occurrence>(`SELECT ${dateColumns} FROM occurrences o JOIN tasks t ON t.id=o.task_id
       WHERE o.id=$1 AND o.group_id=$2 ${lock ? 'FOR UPDATE OF o' : ''}`, [id, viewer.group_id])).rows[0];
     if (!occurrence) throw new UserError('Задача не найдена в твоей группе.');
@@ -145,6 +165,19 @@ export class Service {
     if (task.assignee_id !== viewer.id) throw new UserError('Отметить выполнение может текущий исполнитель.');
     if (undo ? !task.completed_at : !!task.completed_at) throw new UserError(undo ? 'Задача уже открыта.' : 'Задача уже выполнена.');
     if (undo && task.completed_by !== viewer.id) throw new UserError('Отменить можно только свою отметку.');
+    if (task.schedule.overdue === 'weekends') {
+      if (undo) {
+        const pending = await this.db.query('SELECT id FROM occurrences WHERE task_id=$1 AND id<>$2 AND completed_at IS NULL', [task.task_id, id]);
+        if (pending.rows.length) throw new UserError('Нельзя отменить отметку: уже начался следующий цикл задачи.');
+      } else {
+        // A late completion covers all calendar dates up to completion, including cycles not yet materialized.
+        const today = await this.today(viewer);
+        const through = today > task.due_on ? today : task.due_on;
+        let day = nextDue(task.schedule, task.due_on);
+        while (day && day <= through) day = nextDue(task.schedule, day);
+        await this.db.query('UPDATE tasks SET next_on=$1 WHERE id=$2', [day, task.task_id]);
+      }
+    }
     await this.db.query('UPDATE occurrences SET completed_by=$1, completed_at=$2 WHERE id=$3', [undo ? null : viewer.id, undo ? null : this.now, id]);
     await this.closeHelp(id);
     await this.event(id, viewer.id, undo ? 'reopened' : 'completed');
@@ -205,8 +238,9 @@ export class Service {
       const day = localDay(this.now, group.timezone);
       const members = (await this.db.query<Member>(`SELECT m.*,u.profile_name AS name FROM members m JOIN app_users u USING (telegram_id) WHERE group_id=$1`, [group.id])).rows;
       for (const member of members) {
-        const tasks = (await this.db.query<{ title: string; due_on: string }>(`SELECT t.title,o.due_on::text FROM occurrences o JOIN tasks t ON t.id=o.task_id
-          WHERE o.assignee_id=$1 AND o.completed_at IS NULL AND o.due_on<=$2 ORDER BY o.due_on,o.id`, [member.id, day])).rows;
+        const tasks = (await this.db.query<{ title: string; due_on: string; schedule: Schedule }>(`SELECT t.title,o.due_on::text,t.schedule FROM occurrences o JOIN tasks t ON t.id=o.task_id
+          WHERE o.assignee_id=$1 AND o.completed_at IS NULL AND o.due_on<=$2 ORDER BY o.due_on,o.id`, [member.id, day])).rows
+          .filter(task => shouldRemind(task.schedule, task.due_on, day));
         if (tasks.length) await this.send(member.telegram_id, `📋 Твои невыполненные задачи (${tasks.length}):\n${tasks.slice(0,15).map(t => `• ${t.title} — ${t.due_on}`).join('\n')}\n\nОткрыть список: /tasks`, undefined, `reminder:${member.id}:${day}`);
       }
     }

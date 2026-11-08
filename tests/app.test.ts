@@ -9,7 +9,7 @@ import { Service, type Member } from '../src/service.js';
 import { processUpdate } from '../src/bot.js';
 import { flushOutbox, TelegramError } from '../src/outbox.js';
 import { matchesSecret, UserError } from '../src/security.js';
-import { addDays, firstDue, localDay, nextDue, validDay } from '../src/schedule.js';
+import { addDays, firstDue, localDay, nextDue, shouldRemind, validDay, type Schedule } from '../src/schedule.js';
 import webhook from '../api/webhook.js';
 import cron from '../api/cron.js';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -24,12 +24,15 @@ let store: Store;
 let a: Member, b: Member, c: Member, outsider: Member;
 let sequence = 0;
 const run = <T>(fn: (s: Service) => Promise<T>) => store.transaction(db => fn(new Service(db, `test:${sequence++}`, now)));
+const runAt = <T>(day: string, fn: (s: Service) => Promise<T>) => store.transaction(db => fn(new Service(db, `day:${sequence++}`, new Date(`${day}T16:00:00Z`))));
+const firstSaturday: Schedule = { kind: 'monthly_weekday', start: '2026-11-01', ordinal: 1, weekday: 6, overdue: 'weekends' };
 function adapter(db: { query: PGlite['query'] }): Database {
   return { async query<T extends QueryResultRow>(sql: string, values?: unknown[]) { return { rows: (await db.query(sql, values)).rows as T[] }; } };
 }
 before(async () => {
   const sql = await readFile(new URL('../migrations/001_init.sql', import.meta.url), 'utf8')
-    + '\n' + await readFile(new URL('../migrations/002_groups.sql', import.meta.url), 'utf8');
+    + '\n' + await readFile(new URL('../migrations/002_groups.sql', import.meta.url), 'utf8')
+    + '\n' + await readFile(new URL('../migrations/003_coalesced_occurrences.sql', import.meta.url), 'utf8');
   if (process.env.TEST_DATABASE_URL) {
     pool = new pgDriver.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 5 });
     await pool.query(sql);
@@ -87,6 +90,97 @@ test('date and recurrence rules cover Moscow midnight, leap years and short mont
   assert.equal(nextDue(monthly, '2028-01-31'), '2028-02-29');
   assert.equal(nextDue(monthly, '2028-02-29'), '2028-03-31');
   assert.equal(nextDue({ kind: 'once', start: '2026-11-08' }, '2026-11-08'), null);
+});
+
+test('monthly weekday calendar handles first/last dates, leap years and year rollover', () => {
+  assert.equal(firstDue(firstSaturday), '2026-11-07');
+  assert.equal(firstDue({ ...firstSaturday,start: '2026-11-07' }), '2026-11-07');
+  assert.equal(firstDue({ ...firstSaturday,start: '2026-11-08' }), '2026-12-05');
+  assert.equal(nextDue(firstSaturday,'2026-12-05'), '2027-01-02');
+  assert.equal(firstDue({ kind: 'monthly_weekday',start: '2028-02-01',ordinal: -1,weekday: 2 }), '2028-02-29');
+  assert.equal(firstDue({ kind: 'monthly_weekday',start: '2026-02-01',ordinal: 4,weekday: 6 }), '2026-02-28');
+  assert.equal(firstDue({ ...firstSaturday,start: '2026-08-01' }), '2026-08-01');
+  assert.equal(shouldRemind(firstSaturday,'2026-11-07','2026-11-06'),false);
+  assert.equal(shouldRemind(firstSaturday,'2026-11-07','2026-11-07'),true);
+  assert.equal(shouldRemind(firstSaturday,'2026-11-07','2026-11-08'),true);
+  assert.equal(shouldRemind(firstSaturday,'2026-11-07','2026-11-09'),false);
+  assert.equal(shouldRemind(firstSaturday,'2026-11-07','2026-11-14'),true);
+  assert.equal(shouldRemind({ ...firstSaturday,weekday: 2 },'2026-11-03','2026-11-03'),true);
+});
+
+test('missed monthly cycles retain one task and remind on weekends only', async () => {
+  const taskId = await runAt('2026-11-01',s => s.createTask(a,'Месячная проверка',a.id,firstSaturday));
+  const pending = async () => (await store.query('SELECT id,due_on::text FROM occurrences WHERE task_id=$1 AND completed_at IS NULL',[taskId])).rows;
+  const firstId = (await pending())[0]!.id;
+  for (const day of ['2026-11-07','2026-11-08','2026-11-09','2026-11-14','2026-12-05','2027-01-02']) {
+    await runAt(day,s => s.reminders());
+    await runAt(day,s => s.reminders());
+    assert.deepEqual(await pending(),[{ id: firstId,due_on: '2026-11-07' }]);
+  }
+  const reminders = (await store.query("SELECT dedupe_key,payload FROM outbox WHERE dedupe_key LIKE 'reminder:%' ORDER BY id")).rows;
+  assert.equal(reminders.length,5);
+  assert.equal(reminders.some(r => r.dedupe_key.endsWith('2026-11-09')),false);
+  assert.ok(reminders.every(r => r.payload.text.includes('Месячная проверка')));
+  const mondayList = await runAt('2027-01-04',s => s.tasks(a,a.id));
+  assert.equal(mondayList.length,1); // Still visible outside reminder days.
+  assert.equal(mondayList[0]!.id,firstId);
+});
+
+test('late completion covers skipped cycles even without cron and resumes future calendar', async () => {
+  const taskId = await runAt('2026-11-01',s => s.createTask(a,'Проверка',a.id,firstSaturday));
+  const first = (await store.query('SELECT id FROM occurrences WHERE task_id=$1',[taskId])).rows[0]!.id;
+  // No cron or listing between November and January: January's calendar date is already covered.
+  await runAt('2027-01-05',s => s.complete(a,first));
+  assert.equal((await store.query('SELECT next_on::text FROM tasks WHERE id=$1',[taskId])).rows[0]!.next_on,'2027-02-06');
+  assert.equal((await runAt('2027-01-05',s => s.tasks(a,a.id))).length,0);
+  assert.equal((await runAt('2027-02-05',s => s.tasks(a,a.id))).length,0);
+  const next = await runAt('2027-02-06',s => s.tasks(a,a.id));
+  assert.equal(next.length,1); assert.equal(next[0]!.due_on,'2027-02-06');
+  assert.notEqual(next[0]!.id,first);
+  await assert.rejects(runAt('2027-02-06',s => s.complete(a,first,true)),/следующий цикл/);
+  assert.equal((await store.query('SELECT id FROM occurrences WHERE task_id=$1 AND completed_at IS NULL',[taskId])).rows.length,1);
+});
+
+test('single pending task can be transferred and reopened without changing future owner', async () => {
+  const taskId = await runAt('2026-11-01',s => s.createTask(a,'Проверка',a.id,firstSaturday));
+  const first = (await store.query('SELECT id FROM occurrences WHERE task_id=$1',[taskId])).rows[0]!.id;
+  const request = await runAt('2026-11-14',s => s.requestHelp(a,first,[b.id,c.id]));
+  await runAt('2026-11-14',s => s.acceptHelp(b,request));
+  await runAt('2026-12-05',s => s.materialize(a.group_id));
+  const pending = (await store.query('SELECT assignee_id FROM occurrences WHERE task_id=$1 AND completed_at IS NULL',[taskId])).rows;
+  assert.deepEqual(pending,[{ assignee_id: b.id }]);
+  await runAt('2026-12-06',s => s.complete(b,first));
+  await runAt('2026-12-06',s => s.complete(b,first,true));
+  assert.equal((await runAt('2026-12-06',s => s.tasks(b,b.id))).length,1);
+  await runAt('2026-12-06',s => s.complete(b,first));
+  const next = await runAt('2027-01-02',s => s.tasks(a,a.id));
+  assert.equal(next.length,1); assert.equal(next[0]!.assignee_id,a.id);
+  assert.equal(next[0]!.due_on,'2027-01-02');
+});
+
+test('database constraint and concurrent materialization prevent duplicate pending copies', async () => {
+  const taskId = await runAt('2026-11-01',s => s.createTask(a,'Проверка',a.id,firstSaturday));
+  await Promise.all([runAt('2026-12-05',s => s.materialize(a.group_id)),runAt('2026-12-05',s => s.materialize(a.group_id))]);
+  await assert.rejects(store.transaction(db => db.query(`INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id,coalesced)
+    VALUES ($1,$2,'2027-01-02',$3,$3,true)`,[taskId,a.group_id,a.id])),/unique|duplicate/i);
+  assert.equal((await store.query('SELECT id FROM occurrences WHERE task_id=$1 AND completed_at IS NULL',[taskId])).rows.length,1);
+});
+
+test('monthly weekday and weekend recovery can be configured through buttons', async () => {
+  await update(message(100,'/new'));
+  await update(message(101,'Месячная проверка'));
+  await update(callback(102,`owner:${b.id}`));
+  await update(callback(103,'kind:monthly_weekday'));
+  await update(callback(104,'ordinal:1'));
+  await update(callback(105,'monthweekday:6'));
+  await update(message(106,'2026-11-08'));
+  await update(callback(107,'overdue:weekends'));
+  await update(callback(108,'createtask'));
+  const task = (await store.query('SELECT schedule FROM tasks')).rows[0]!;
+  assert.deepEqual(task.schedule,{ kind: 'monthly_weekday',start: '2026-11-08',ordinal: 1,weekday: 6,overdue: 'weekends' });
+  assert.equal((await store.query('SELECT due_on::text FROM occurrences')).rows[0]!.due_on,'2026-12-05');
+  await runAt('2027-01-02',s => s.materialize(a.group_id));
+  assert.equal((await store.query('SELECT id FROM occurrences WHERE completed_at IS NULL')).rows.length,1);
 });
 
 test('group migration preserves existing memberships, assignments and private aliases', async () => {
@@ -216,6 +310,7 @@ test('interactive task creation survives updates and uses fixed assignment', asy
   await update(callback(23,'kind:weekly'));
   await update(message(24,'2026-11-08'));
   await update(message(25,'1,3,5'));
+  await update(callback(250,'overdue:daily'));
   await update(callback(26,'createtask'));
   await update(callback(26,'createtask'));
   const tasks = (await store.query('SELECT * FROM tasks')).rows;
