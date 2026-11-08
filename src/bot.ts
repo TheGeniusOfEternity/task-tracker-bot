@@ -14,7 +14,7 @@ function navigationKeyboard(member?: Member) {
   const result = new InlineKeyboard();
   if (member) {
     result.text('📋 Мои задачи','mine').row().text('👥 Группа','group').row().text('➕ Создать задачу','new');
-    if (member.role === 'admin') result.row().text('🛠 Админка','admin').row().text('🔗 Приглашение','invite').row().text('⚙️ Настройки','settings');
+    if (member.role === 'admin') result.row().text('🛠 Админка','admin').row().text('🔗 Приглашение','invite');
   } else result.text('🏠 Меню','menu');
   return result;
 }
@@ -51,7 +51,7 @@ async function memberCard(s: Service, viewer: Member, targetId: number) {
 async function adminPanel(s: Service, viewer: Member) {
   s.admin(viewer);
   await s.screen(viewer.telegram_id,'🛠 Админка',keyboard([
-    [button('📋 Все задачи','alltasks:0')],[button('📖 Журнал','history')],[button('🏠 Меню','menu')],
+    [button('📋 Все задачи','alltasks:0')],[button('📖 Журнал','history')],[button('⚙️ Настройки','settings')],[button('🏠 Меню','menu')],
   ]));
 }
 const escapeHtml = (value: string) => value.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -78,7 +78,7 @@ async function settings(s: Service, viewer: Member, saved = false) {
   const group = await s.reminderSettings(viewer);
   const hour = String(group.reminder_hour).padStart(2,'0');
   await s.screen(viewer.telegram_id,`${saved ? 'Час рассылки сохранён.\n\n' : ''}⚙️ Настройки группы\n\nРассылка задач: ${hour}:00 (${group.timezone}).\nОдин раз в день. На бесплатном тарифе сообщение приходит в пределах выбранного часа. Если сегодня рассылка уже была, новое время действует со следующего дня.`,keyboard([
-    [button('⏰ Час рассылки','reminderhours')],[button('🏠 Меню','menu')],
+    [button('⏰ Час рассылки','reminderhours')],[button('⬅️ Назад','admin'),button('🏠 Меню','menu')],
   ]));
 }
 async function reminderHours(s: Service, viewer: Member) {

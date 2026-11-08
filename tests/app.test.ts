@@ -921,7 +921,7 @@ test('admin panel contains history and all tasks while ordinary members cannot a
   assert.ok(actions(main).includes('admin')); assert.equal(actions(main).includes('history'),false);
   await update(callback(2201,'admin'));
   const panel = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:2201:0'")).rows[0]!.payload;
-  assert.deepEqual(actions(panel),['alltasks:0','history','menu']);
+  assert.deepEqual(actions(panel),['alltasks:0','history','settings','menu']);
   for (const [index,data] of ['admin','alltasks:0','history'].entries()) {
     await update(callback(2202+index,data,102));
     assert.equal((await store.query('SELECT payload FROM outbox WHERE dedupe_key=$1',[`error:${2202+index}:0`])).rows[0]!.payload.show_alert,true);
