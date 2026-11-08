@@ -138,7 +138,7 @@ async function periodPicker(s: Service, viewer: Member, session: Session) {
 async function ordinalPicker(s: Service, viewer: Member, session: Session) {
   await s.saveSession(viewer.telegram_id,{ ...session,step: 'task_ordinal' });
   await s.screen(viewer.telegram_id,`Ежемесячно · ${weekdaysLabel(session.weekdays as number[])}\n\nКакие по счёту выбранные дни месяца?`,keyboard([
-    ...[1,2,3,4,-1].map(n => [button(`🗓 ${ordinalPlural[n]!}`,`ordinal:${n}`)]),taskNavigation(),
+    ...[1,2,3,4,-1].map(n => [button(`🗓 ${ordinalPlural[n]!.replace(/^./u,letter => letter.toUpperCase())}`,`ordinal:${n}`)]),taskNavigation(),
   ]));
 }
 async function taskBack(s: Service, viewer: Member, session: Session) {
