@@ -2,7 +2,7 @@ import { Bot, BotError, InlineKeyboard } from 'grammy';
 import type { Update, UserFromGetMe } from 'grammy/types';
 import type { Store } from './db.js';
 import { Service, type Member, type Session } from './service.js';
-import { firstDue, ordinalPlural, scheduleLabel, validDay, weekdayShortNames, weekdaysLabel, type Schedule } from './schedule.js';
+import { addDays, firstDue, ordinalPlural, scheduleLabel, validDay, weekdayShortNames, weekdaysLabel, type Schedule } from './schedule.js';
 import { UserError } from './security.js';
 
 export interface BotOptions { token: string; adminIds: string[]; botInfo: UserFromGetMe; now?: Date; botId?: string }
@@ -97,17 +97,27 @@ async function helpPicker(s: Service, viewer: Member, session: Session) {
     keyboard([...targets.map(m => [button(`${selected.includes(m.id) ? '✅ ' : ''}${m.name}`, `pickhelp:${m.id}`)]),
       [button('Отмена','cancel'),button(`Отправить (${selected.length})`, 'sendhelp')]]));
 }
+const taskNavigation = (back = true) => [...(back ? [button('Назад','taskback')] : []),button('Отмена','cancel')];
+async function titlePicker(s: Service, viewer: Member, session: Session) {
+  await s.saveSession(viewer.telegram_id,{ ...session,step: 'task_title' });
+  await s.screen(viewer.telegram_id,'Как называется задача? До 160 символов.',keyboard([taskNavigation(false)]));
+}
+async function ownerPicker(s: Service, viewer: Member, session: Session) {
+  await s.saveSession(viewer.telegram_id,{ ...session,step: 'task_owner' });
+  await s.screen(viewer.telegram_id,'Кому назначить задачу?',keyboard([
+    ...(await s.members(viewer)).map(m => [button(m.name,`owner:${m.id}`)]),taskNavigation(),
+  ]));
+}
 async function newTask(s: Service, viewer: Member) {
   s.admin(viewer);
-  await s.saveSession(viewer.telegram_id, { step: 'task_title' });
-  await s.screen(viewer.telegram_id, `Как называется задача? До 160 символов.${cancelHint}`);
+  await titlePicker(s,viewer,{ step: 'task_title' });
 }
 async function daysPicker(s: Service, viewer: Member, session: Session, messageId?: number) {
   const selected = session.weekdays as number[];
   await s.saveSession(viewer.telegram_id,{ ...session,step: 'task_days' });
   const days = weekdayShortNames.map((name,index) => button(`${selected.includes(index + 1) ? '✅' : '⬜️'} ${name}`,`taskday:${index + 1}`));
   const text = `Отметь нужные дни и нажми «Готово».\nВыбрано: ${selected.length ? weekdaysLabel(selected) : 'пока ничего'}`;
-  const markup = keyboard([days.slice(0,4),days.slice(4),[button(selected.length === 7 ? 'Снять все' : 'Каждый день','taskdaysall')],[button('← Меню','menu'),button('Готово','taskdaysdone')]]);
+  const markup = keyboard([days.slice(0,4),days.slice(4),[button(selected.length === 7 ? 'Снять все' : 'Каждый день','taskdaysall')],[...taskNavigation(),button('Готово','taskdaysdone')]]);
   if (messageId) await s.enqueue('editMessageText',{ chat_id: viewer.telegram_id,message_id: messageId,text,reply_markup: markup });
   else await s.screen(viewer.telegram_id,text,markup);
 }
@@ -115,12 +125,30 @@ async function periodPicker(s: Service, viewer: Member, session: Session) {
   await s.saveSession(viewer.telegram_id,{ ...session,step: 'task_period' });
   await s.screen(viewer.telegram_id,`Как часто повторять?\n\nДни: ${weekdaysLabel(session.weekdays as number[])}`,keyboard([
     [button('Без повтора','period:once')],[button('Еженедельно','period:weekly')],[button('Ежемесячно','period:monthly')],
-    [button('← Дни недели','backdays'),button('← Меню','menu')],
+    [button(session.manualStart ? `Дата: ${session.manualStart}` : 'Дата: автоматически','taskdate')],
+    [button(session.overdue === 'daily' ? 'Просрочка: каждый день' : 'Просрочка: по выходным, без копий','taskreminders')],
+    taskNavigation(),
   ]));
+}
+async function ordinalPicker(s: Service, viewer: Member, session: Session) {
+  await s.saveSession(viewer.telegram_id,{ ...session,step: 'task_ordinal' });
+  await s.screen(viewer.telegram_id,`Ежемесячно · ${weekdaysLabel(session.weekdays as number[])}\n\nКакие по счёту выбранные дни месяца?`,keyboard([
+    ...[1,2,3,4,-1].map(n => [button(ordinalPlural[n]!,`ordinal:${n}`)]),taskNavigation(),
+  ]));
+}
+async function taskBack(s: Service, viewer: Member, session: Session) {
+  switch (session.step) {
+    case 'task_owner': return titlePicker(s,viewer,session);
+    case 'task_days': return ownerPicker(s,viewer,session);
+    case 'task_period': return daysPicker(s,viewer,session);
+    case 'task_ordinal': case 'task_date': case 'task_overdue': return periodPicker(s,viewer,session);
+    case 'task_confirm': return session.kind === 'monthly_weekday' ? ordinalPicker(s,viewer,session) : periodPicker(s,viewer,session);
+    default: throw new UserError('Эта кнопка устарела.');
+  }
 }
 async function askStart(s: Service, viewer: Member, session: Session) {
   await s.saveSession(viewer.telegram_id,{ ...session,step: 'task_date' });
-  await s.screen(viewer.telegram_id,`Введи ${session.kind === 'once' ? 'срок' : 'дату начала'} в формате ГГГГ-ММ-ДД.\nСегодня: ${await s.today(viewer)}.${cancelHint}`);
+  await s.screen(viewer.telegram_id,'Введи дату в формате ГГГГ-ММ-ДД.',keyboard([[button('Определять автоматически','taskdateauto')],taskNavigation()]));
 }
 async function invite(s: Service, admin: Member, username: string, created = false) {
   const code = await s.invite(admin);
@@ -145,14 +173,10 @@ async function textInput(s: Service, uid: string, text: string) {
   s.admin(viewer);
   if (session.step === 'task_title') {
     if (!text.trim() || text.length > 160) throw new UserError('Название должно содержать от 1 до 160 символов.');
-    await s.saveSession(uid, { ...session,step: 'task_owner', title: text.trim() });
-    await s.screen(uid, 'Кому назначить задачу?', keyboard([...(await s.members(viewer)).map(m => [button(m.name, `owner:${m.id}`)]),[button('← Меню','menu')]]));
+    await ownerPicker(s,viewer,{ ...session,title: text.trim() });
   } else if (session.step === 'task_date') {
     if (!validDay(text) || text < await s.today(viewer) || text > '2100-12-31') throw new UserError('Введи дату от сегодняшнего дня до 2100 года в формате ГГГГ-ММ-ДД.');
-    const next = { ...session, start: text };
-    if (session.kind === 'weekly' && !session.weekdays) {
-      await daysPicker(s,viewer,{ ...next,weekdays: [] });
-    } else await chooseOverdue(s, viewer, next);
+    await periodPicker(s,viewer,{ ...session,manualStart: text });
   } else if (session.step === 'task_weekdays') {
     await daysPicker(s,viewer,{ ...session,weekdays: [] });
   } else throw new UserError('Выбери вариант кнопкой или отмени действие: /cancel');
@@ -160,20 +184,24 @@ async function textInput(s: Service, uid: string, text: string) {
 function sessionSchedule(session: Session): Schedule {
   return { kind: session.kind as Schedule['kind'], start: session.start as string,
     ...(session.weekdays && session.kind !== 'once' ? { weekdays: session.weekdays as number[] } : {}),
-    ...(session.weekday ? { weekday: Number(session.weekday) } : {}),
-    ...(session.ordinal !== undefined ? { ordinal: Number(session.ordinal) } : {}),
+    ...(session.kind === 'monthly_weekday' && session.weekday ? { weekday: Number(session.weekday) } : {}),
+    ...(session.kind === 'monthly_weekday' && session.ordinal !== undefined ? { ordinal: Number(session.ordinal) } : {}),
     overdue: session.overdue as Schedule['overdue'] };
 }
 async function chooseOverdue(s: Service, viewer: Member, session: Session) {
   await s.saveSession(viewer.telegram_id, { ...session, step: 'task_overdue' });
   await s.screen(viewer.telegram_id, 'Что делать, если задача просрочена?\n\nПо выходным: напоминать по субботам и воскресеньям до выполнения. Новые календарные сроки не создают копий открытой задачи.\n\nКаждый день: напоминать ежедневно, каждое повторение учитывается отдельно.',
-    keyboard([[button('По выходным, без копий', 'overdue:weekends')], [button('Каждый день, отдельно', 'overdue:daily')], [button('Отмена', 'cancel')]]));
+    keyboard([[button('По выходным, без копий', 'overdue:weekends')], [button('Каждый день, отдельно', 'overdue:daily')], taskNavigation()]));
 }
 async function confirmTask(s: Service, viewer: Member, session: Session) {
+  const today = await s.today(viewer);
+  const start = session.manualStart as string | undefined ?? (session.kind === 'once'
+    ? firstDue({ kind: 'weekly',start: addDays(today,1),weekdays: session.weekdays as number[] }) : today);
+  session = { ...session,start,overdue: session.overdue ?? 'weekends' };
   const schedule = sessionSchedule(session);
-  await s.saveSession(viewer.telegram_id, { ...session, step: 'task_confirm' });
+  await s.saveSession(viewer.telegram_id, { ...session, step: 'task_confirm',calculatedOn: today });
   await s.screen(viewer.telegram_id, `Создать задачу?\n\n${session.title}\nИсполнитель: ${await s.name(viewer, Number(session.owner))}\n${scheduleLabel(schedule)}\nПервый срок: ${firstDue(schedule)}\nСрок — до конца дня по Москве.${schedule.kind === 'monthly' ? '\nВ коротком месяце — последний день месяца.' : ''}\n${schedule.overdue === 'weekends' ? 'Просрочка: напоминания по выходным, одна задача до выполнения. После выполнения — ближайший будущий срок по календарю.' : 'Просрочка: ежедневные напоминания; повторения учитываются отдельно.'}`,
-    keyboard([[button('Отмена','cancel'),button('Создать', 'createtask')]]));
+    keyboard([[...taskNavigation(),button('Создать', 'createtask')]]));
 }
 
 export async function processUpdate(store: Store, update: Update, options: BotOptions) {
@@ -258,7 +286,7 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_owner');
           const target = await s.target(viewer, id(arg));
           const next = { ...session,owner: target.id };
-          await daysPicker(s,viewer,{ ...next,weekdays: [] });
+          await daysPicker(s,viewer,{ ...next,weekdays: session.weekdays ?? [] });
         } else if (action === 'taskday' || action === 'taskdaysall' || action === 'taskdaysdone') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_days');
           let selected = session.weekdays as number[];
@@ -270,19 +298,27 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
             else { const day = id(arg); if (day > 7) throw new UserError('Выбери день от понедельника до воскресенья.'); selected = selected.includes(day) ? selected.filter(x => x !== day) : [...selected,day]; }
             await daysPicker(s,viewer,{ ...session,weekdays: selected.sort((a,b) => a - b) },ctx.callbackQuery.message?.message_id);
           }
+        } else if (action === 'taskback') {
+          s.admin(viewer); const session = await s.session(uid);
+          if (!session?.step.startsWith('task_')) throw new UserError('Эта кнопка устарела.');
+          await taskBack(s,viewer,session);
+        } else if (action === 'taskdate' || action === 'taskreminders') {
+          s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_period');
+          if (action === 'taskdate') await askStart(s,viewer,session);
+          else await chooseOverdue(s,viewer,session);
+        } else if (action === 'taskdateauto') {
+          s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_date');
+          const next = { ...session }; delete next.manualStart; await periodPicker(s,viewer,next);
         } else if (action === 'backdays') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_period'); await daysPicker(s,viewer,session);
         } else if (action === 'backperiod') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_ordinal'); await periodPicker(s,viewer,session);
         } else if (action === 'period') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_period');
-          if (arg === 'once') await askStart(s,viewer,{ ...session,kind: 'once' });
-          else if (arg === 'weekly') await askStart(s,viewer,{ ...session,kind: (session.weekdays as number[]).length === 7 ? 'daily' : 'weekly' });
+          if (arg === 'once') await confirmTask(s,viewer,{ ...session,kind: 'once' });
+          else if (arg === 'weekly') await confirmTask(s,viewer,{ ...session,kind: (session.weekdays as number[]).length === 7 ? 'daily' : 'weekly' });
           else if (arg === 'monthly') {
-            await s.saveSession(uid,{ ...session,kind: 'monthly_weekday',step: 'task_ordinal' });
-            await s.screen(uid,`Ежемесячно · ${weekdaysLabel(session.weekdays as number[])}\n\nКакие по счёту выбранные дни месяца?\nНапример: первые Пн и Сб месяца.`,keyboard([
-              ...[1,2,3,4,-1].map(n => [button(ordinalPlural[n]!, `ordinal:${n}`)]),[button('← Назад','backperiod'),button('← Меню','menu')],
-            ]));
+            await ordinalPicker(s,viewer,{ ...session,kind: 'monthly_weekday' });
           } else throw new UserError('Выбери «Без повтора», «Еженедельно» или «Ежемесячно».');
         } else if (action === 'kind') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_kind');
@@ -291,21 +327,26 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_ordinal');
           const ordinal = Number(arg);
           if (![1,2,3,4,-1].includes(ordinal)) throw new UserError('Выбери порядковый номер кнопкой.');
-          if (session.weekdays) await askStart(s,viewer,{ ...session,ordinal });
+          if (session.weekdays) await confirmTask(s,viewer,{ ...session,ordinal });
           else await daysPicker(s,viewer,{ ...session,weekdays: [] });
         } else if (action === 'monthweekday') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_month_weekday');
           const weekday = id(arg);
           if (weekday > 7) throw new UserError('Выбери день недели кнопкой.');
-          await askStart(s,viewer,{ ...session,weekday });
+          await confirmTask(s,viewer,{ ...session,weekday });
         } else if (action === 'overdue') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_overdue');
           if (arg !== 'daily' && arg !== 'weekends') throw new UserError('Выбери режим просрочки кнопкой.');
-          await confirmTask(s, viewer, { ...session, overdue: arg });
+          await periodPicker(s, viewer, { ...session, overdue: arg });
         } else if (action === 'createtask') {
           s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_confirm');
-          await s.createTask(viewer, String(session.title), Number(session.owner), sessionSchedule(session));
-          await s.saveSession(uid); await s.screen(uid, 'Задача создана. Исполнитель получит уведомление.'); await main(s, uid);
+          if (!session.manualStart && session.calculatedOn !== await s.today(viewer)) {
+            await confirmTask(s,viewer,session);
+          } else {
+            if (session.manualStart && String(session.manualStart) < await s.today(viewer)) throw new UserError('Указанная дата уже прошла. Вернись назад и выбери новую дату или автоматический срок.');
+            await s.createTask(viewer, String(session.title), Number(session.owner), sessionSchedule(session));
+            await s.saveSession(uid); await s.screen(uid, 'Задача создана. Исполнитель получит уведомление.'); await main(s, uid);
+          }
         } else throw new UserError('Кнопка устарела. Открой меню: /start');
       }
       await s.enqueue('answerCallbackQuery', { callback_query_id: ctx.callbackQuery.id });
@@ -318,7 +359,10 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
       await db.query('ROLLBACK TO SAVEPOINT bot_action');
       const failed = new Service(db, `error:${update.update_id}`, options.now,botId);
       if (update.callback_query) await failed.enqueue('answerCallbackQuery', { callback_query_id: update.callback_query.id, text: error.message.slice(0, 200), show_alert: true });
-      else await failed.screen(uid, error.message,navigationKeyboard(await failed.member(uid)));
+      else {
+        const session = await failed.session(uid);
+        await failed.screen(uid,error.message,session?.step.startsWith('task_') ? keyboard([taskNavigation(session.step !== 'task_title')]) : navigationKeyboard(await failed.member(uid)));
+      }
     }
   });
 }
