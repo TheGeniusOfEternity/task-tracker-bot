@@ -12,7 +12,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     await getStore().transaction(async db => {
       // Lock one row so overlapping invocations never generate duplicate reminders.
-      await db.query('SELECT id FROM families ORDER BY id FOR UPDATE');
+      await db.query('SELECT id FROM task_groups ORDER BY id FOR UPDATE');
       await new Service(db, `cron:${Date.now()}`).reminders();
       await db.query('DELETE FROM sessions WHERE expires_at<now()');
       await db.query("DELETE FROM processed_updates WHERE created_at<now()-interval '30 days'");

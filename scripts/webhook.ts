@@ -11,7 +11,7 @@ await api.setWebhook(url.href, { secret_token: secret, allowed_updates: ['messag
 await api.setMyCommands([
   { command: 'start', description: 'Главное меню' },
   { command: 'tasks', description: 'Мои задачи' },
-  { command: 'family', description: 'Семья и личные имена' },
+  { command: 'group', description: 'Группа и личные имена' },
   { command: 'history', description: 'Журнал за неделю' },
   { command: 'new', description: 'Создать задачу (админ)' },
   { command: 'join', description: 'Вступить по коду' },

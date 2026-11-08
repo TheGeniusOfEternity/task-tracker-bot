@@ -3,13 +3,13 @@ import type { Database } from './db.js';
 import { addDays, firstDue, localDay, nextDue, type Schedule } from './schedule.js';
 import { hashCode, UserError } from './security.js';
 
-export interface Member { id: number; family_id: number; telegram_id: string; role: 'admin' | 'member'; name: string }
+export interface Member { id: number; group_id: number; telegram_id: string; role: 'admin' | 'member'; name: string }
 export interface Occurrence {
-  id: number; task_id: number; family_id: number; title: string; due_on: string;
+  id: number; task_id: number; group_id: number; title: string; due_on: string;
   original_owner_id: number; assignee_id: number; completed_by: number | null; completed_at: Date | null;
 }
 export type Session = { step: string; [key: string]: unknown };
-const dateColumns = `o.id, o.task_id, o.family_id, t.title, o.due_on::text, o.original_owner_id, o.assignee_id, o.completed_by, o.completed_at`;
+const dateColumns = `o.id, o.task_id, o.group_id, t.title, o.due_on::text, o.original_owner_id, o.assignee_id, o.completed_by, o.completed_at`;
 export class Service {
   private sequence = 0;
   constructor(readonly db: Database, readonly key: string, readonly now = new Date()) {}
@@ -26,17 +26,17 @@ export class Service {
   }
   async requireMember(telegramId: string) {
     const member = await this.member(telegramId);
-    if (!member) throw new UserError('Сначала вступи в семью по коду приглашения. Отправь /join КОД.');
+    if (!member) throw new UserError('Сначала вступи в группу по коду приглашения. Отправь /join КОД.');
     return member;
   }
   async members(viewer: Member): Promise<Member[]> {
     return (await this.db.query<Member>(`SELECT m.*, coalesce(a.name,u.profile_name) AS name FROM members m
       JOIN app_users u USING (telegram_id) LEFT JOIN aliases a ON a.target_id=m.id AND a.viewer_id=$1
-      WHERE m.family_id=$2 ORDER BY m.id`, [viewer.id, viewer.family_id])).rows;
+      WHERE m.group_id=$2 ORDER BY m.id`, [viewer.id, viewer.group_id])).rows;
   }
   async target(viewer: Member, id: number) {
     const member = (await this.members(viewer)).find(m => m.id === id);
-    if (!member) throw new UserError('Участник не найден в твоей семье.');
+    if (!member) throw new UserError('Участник не найден в твоей группе.');
     return member;
   }
   async name(viewer: Member, targetId: number) { return (await this.target(viewer, targetId)).name; }
@@ -50,28 +50,28 @@ export class Service {
     await this.target(viewer, targetId);
     await this.db.query('DELETE FROM aliases WHERE viewer_id=$1 AND target_id=$2', [viewer.id, targetId]);
   }
-  async createFamily(telegramId: string, name: string, allowedIds: string[]) {
-    if (!allowedIds.includes(telegramId)) throw new UserError('Создание семьи доступно администратору бота. Для вступления используй код приглашения.');
-    if (await this.member(telegramId)) throw new UserError('Ты уже состоишь в семье.');
-    if (!name.trim() || name.trim().length > 80) throw new UserError('Название семьи: от 1 до 80 символов.');
-    const family = (await this.db.query<{ id: number }>('INSERT INTO families (name) VALUES ($1) RETURNING id', [name.trim()])).rows[0]!;
-    await this.db.query(`INSERT INTO members (family_id,telegram_id,role) VALUES ($1,$2,'admin')`, [family.id, telegramId]);
+  async createGroup(telegramId: string, name: string, allowedIds: string[]) {
+    if (!allowedIds.includes(telegramId)) throw new UserError('Создание группы доступно администратору бота. Для вступления используй код приглашения.');
+    if (await this.member(telegramId)) throw new UserError('Ты уже состоишь в группе.');
+    if (!name.trim() || name.trim().length > 80) throw new UserError('Название группы: от 1 до 80 символов.');
+    const group = (await this.db.query<{ id: number }>('INSERT INTO task_groups (name) VALUES ($1) RETURNING id', [name.trim()])).rows[0]!;
+    await this.db.query(`INSERT INTO members (group_id,telegram_id,role) VALUES ($1,$2,'admin')`, [group.id, telegramId]);
     return this.requireMember(telegramId);
   }
   async invite(admin: Member) {
     this.admin(admin);
     const code = randomBytes(10).toString('hex').toUpperCase();
-    await this.db.query(`UPDATE families SET invite_hash=$1, invite_expires_at=$2 WHERE id=$3`,
-      [hashCode(code), new Date(this.now.getTime() + 7 * 86400_000), admin.family_id]);
+    await this.db.query(`UPDATE task_groups SET invite_hash=$1, invite_expires_at=$2 WHERE id=$3`,
+      [hashCode(code), new Date(this.now.getTime() + 7 * 86400_000), admin.group_id]);
     return code;
   }
   async join(telegramId: string, code: string) {
-    if (await this.member(telegramId)) throw new UserError('Ты уже состоишь в семье.');
-    const family = (await this.db.query<{ id: number }>('SELECT id FROM families WHERE invite_hash=$1 AND invite_expires_at>$2', [hashCode(code), this.now])).rows[0];
-    if (!family) throw new UserError('Код не найден или истёк. Попроси администратора прислать новый.');
-    await this.db.query(`INSERT INTO members (family_id,telegram_id,role) VALUES ($1,$2,'member')`, [family.id, telegramId]);
+    if (await this.member(telegramId)) throw new UserError('Ты уже состоишь в группе.');
+    const group = (await this.db.query<{ id: number }>('SELECT id FROM task_groups WHERE invite_hash=$1 AND invite_expires_at>$2', [hashCode(code), this.now])).rows[0];
+    if (!group) throw new UserError('Код не найден или истёк. Попроси администратора прислать новый.');
+    await this.db.query(`INSERT INTO members (group_id,telegram_id,role) VALUES ($1,$2,'member')`, [group.id, telegramId]);
   }
-  admin(member: Member) { if (member.role !== 'admin') throw new UserError('Это действие доступно администратору семьи.'); }
+  admin(member: Member) { if (member.role !== 'admin') throw new UserError('Это действие доступно администратору группы.'); }
   async session(telegramId: string): Promise<Session | undefined> {
     return (await this.db.query<{ data: Session }>('SELECT data FROM sessions WHERE telegram_id=$1 AND expires_at>$2', [telegramId, this.now])).rows[0]?.data;
   }
@@ -82,34 +82,34 @@ export class Service {
       [telegramId, JSON.stringify(data), new Date(this.now.getTime() + 3600_000)]);
   }
   async today(member: Member) {
-    const family = (await this.db.query<{ timezone: string }>('SELECT timezone FROM families WHERE id=$1', [member.family_id])).rows[0]!;
-    return localDay(this.now, family.timezone);
+    const group = (await this.db.query<{ timezone: string }>('SELECT timezone FROM task_groups WHERE id=$1', [member.group_id])).rows[0]!;
+    return localDay(this.now, group.timezone);
   }
   async createTask(admin: Member, title: string, ownerId: number, schedule: Schedule) {
     this.admin(admin);
     await this.target(admin, ownerId);
     if (!title.trim() || title.trim().length > 160) throw new UserError('Название задачи: от 1 до 160 символов.');
     const first = firstDue(schedule);
-    const task = (await this.db.query<{ id: number }>(`INSERT INTO tasks (family_id,title,owner_id,schedule,next_on)
-      VALUES ($1,$2,$3,$4,$5) RETURNING id`, [admin.family_id, title.trim(), ownerId, JSON.stringify(schedule), nextDue(schedule, first)])).rows[0]!;
+    const task = (await this.db.query<{ id: number }>(`INSERT INTO tasks (group_id,title,owner_id,schedule,next_on)
+      VALUES ($1,$2,$3,$4,$5) RETURNING id`, [admin.group_id, title.trim(), ownerId, JSON.stringify(schedule), nextDue(schedule, first)])).rows[0]!;
     // Always expose the first occurrence, even when its date is beyond the rolling horizon.
-    await this.db.query(`INSERT INTO occurrences (task_id,family_id,due_on,original_owner_id,assignee_id)
-      VALUES ($1,$2,$3,$4,$4)`, [task.id, admin.family_id, first, ownerId]);
-    await this.materialize(admin.family_id);
+    await this.db.query(`INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id)
+      VALUES ($1,$2,$3,$4,$4)`, [task.id, admin.group_id, first, ownerId]);
+    await this.materialize(admin.group_id);
     const owner = await this.target(admin, ownerId);
-    await this.send(owner.telegram_id, `🧹 Тебе назначена задача: ${title.trim()}\nНачало: ${schedule.start}\nПосмотреть: /tasks`, undefined, `task-created:${task.id}`);
+    await this.send(owner.telegram_id, `📋 Тебе назначена задача: ${title.trim()}\nНачало: ${schedule.start}\nПосмотреть: /tasks`, undefined, `task-created:${task.id}`);
     return task.id;
   }
-  async materialize(familyId: number) {
-    const family = (await this.db.query<{ timezone: string }>('SELECT timezone FROM families WHERE id=$1', [familyId])).rows[0]!;
-    const through = addDays(localDay(this.now, family.timezone), 7);
+  async materialize(groupId: number) {
+    const group = (await this.db.query<{ timezone: string }>('SELECT timezone FROM task_groups WHERE id=$1', [groupId])).rows[0]!;
+    const through = addDays(localDay(this.now, group.timezone), 7);
     const tasks = (await this.db.query<{ id: number; owner_id: number; schedule: Schedule; next_on: string }>(
-      `SELECT id,owner_id,schedule,next_on::text FROM tasks WHERE family_id=$1 AND active AND next_on<=$2 ORDER BY id FOR UPDATE`, [familyId, through])).rows;
+      `SELECT id,owner_id,schedule,next_on::text FROM tasks WHERE group_id=$1 AND active AND next_on<=$2 ORDER BY id FOR UPDATE`, [groupId, through])).rows;
     for (const task of tasks) {
       let day: string | null = task.next_on;
       for (let i = 0; day && day <= through && i < 500; i++) {
-        await this.db.query(`INSERT INTO occurrences (task_id,family_id,due_on,original_owner_id,assignee_id)
-          VALUES ($1,$2,$3,$4,$4) ON CONFLICT (task_id,due_on) DO NOTHING`, [task.id, familyId, day, task.owner_id]);
+        await this.db.query(`INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id)
+          VALUES ($1,$2,$3,$4,$4) ON CONFLICT (task_id,due_on) DO NOTHING`, [task.id, groupId, day, task.owner_id]);
         day = nextDue(task.schedule, day);
       }
       await this.db.query('UPDATE tasks SET next_on=$1 WHERE id=$2', [day, task.id]);
@@ -117,15 +117,15 @@ export class Service {
   }
   async tasks(viewer: Member, ownerId: number, page = 0) {
     await this.target(viewer, ownerId);
-    await this.materialize(viewer.family_id);
+    await this.materialize(viewer.group_id);
     return (await this.db.query<Occurrence>(`SELECT ${dateColumns} FROM occurrences o JOIN tasks t ON t.id=o.task_id
-      WHERE o.family_id=$1 AND o.assignee_id=$2 AND o.completed_at IS NULL
-      ORDER BY o.due_on,o.id LIMIT 6 OFFSET $3`, [viewer.family_id, ownerId, Math.max(0, Math.min(10000, page)) * 5])).rows;
+      WHERE o.group_id=$1 AND o.assignee_id=$2 AND o.completed_at IS NULL
+      ORDER BY o.due_on,o.id LIMIT 6 OFFSET $3`, [viewer.group_id, ownerId, Math.max(0, Math.min(10000, page)) * 5])).rows;
   }
   async occurrence(viewer: Member, id: number, lock = false): Promise<Occurrence> {
     const occurrence = (await this.db.query<Occurrence>(`SELECT ${dateColumns} FROM occurrences o JOIN tasks t ON t.id=o.task_id
-      WHERE o.id=$1 AND o.family_id=$2 ${lock ? 'FOR UPDATE OF o' : ''}`, [id, viewer.family_id])).rows[0];
-    if (!occurrence) throw new UserError('Задача не найдена в твоей семье.');
+      WHERE o.id=$1 AND o.group_id=$2 ${lock ? 'FOR UPDATE OF o' : ''}`, [id, viewer.group_id])).rows[0];
+    if (!occurrence) throw new UserError('Задача не найдена в твоей группе.');
     return occurrence;
   }
   async event(id: number, actor: number, kind: string, details: Record<string, unknown> = {}) {
@@ -170,7 +170,7 @@ export class Service {
   async acceptHelp(viewer: Member, requestId: number) {
     const request = (await this.db.query<{ occurrence_id: number; requester_id: number }>(`SELECT h.occurrence_id,h.requester_id FROM help_requests h
       JOIN help_recipients r ON r.request_id=h.id JOIN occurrences o ON o.id=h.occurrence_id
-      WHERE h.id=$1 AND r.member_id=$2 AND o.family_id=$3`, [requestId, viewer.id, viewer.family_id])).rows[0];
+      WHERE h.id=$1 AND r.member_id=$2 AND o.group_id=$3`, [requestId, viewer.id, viewer.group_id])).rows[0];
     if (!request) throw new UserError('Эта просьба адресована другому участнику.');
     // Every operation locks the occurrence first. Competing accept/completion/cancel calls serialize here.
     const task = await this.occurrence(viewer, request.occurrence_id, true);
@@ -196,18 +196,18 @@ export class Service {
   async history(viewer: Member) {
     return (await this.db.query<{ title: string; kind: string; actor_id: number; created_at: Date; due_on: string }>(`SELECT t.title,e.kind,e.actor_id,e.created_at,o.due_on::text FROM events e
       JOIN occurrences o ON o.id=e.occurrence_id JOIN tasks t ON t.id=o.task_id
-      WHERE o.family_id=$1 AND e.created_at >= $2 ORDER BY e.id DESC LIMIT 20`, [viewer.family_id, new Date(this.now.getTime() - 7 * 86400_000)])).rows;
+      WHERE o.group_id=$1 AND e.created_at >= $2 ORDER BY e.id DESC LIMIT 20`, [viewer.group_id, new Date(this.now.getTime() - 7 * 86400_000)])).rows;
   }
   async reminders() {
-    const families = (await this.db.query<{ id: number; timezone: string }>('SELECT id,timezone FROM families ORDER BY id')).rows;
-    for (const family of families) {
-      await this.materialize(family.id);
-      const day = localDay(this.now, family.timezone);
-      const members = (await this.db.query<Member>(`SELECT m.*,u.profile_name AS name FROM members m JOIN app_users u USING (telegram_id) WHERE family_id=$1`, [family.id])).rows;
+    const groups = (await this.db.query<{ id: number; timezone: string }>('SELECT id,timezone FROM task_groups ORDER BY id')).rows;
+    for (const group of groups) {
+      await this.materialize(group.id);
+      const day = localDay(this.now, group.timezone);
+      const members = (await this.db.query<Member>(`SELECT m.*,u.profile_name AS name FROM members m JOIN app_users u USING (telegram_id) WHERE group_id=$1`, [group.id])).rows;
       for (const member of members) {
         const tasks = (await this.db.query<{ title: string; due_on: string }>(`SELECT t.title,o.due_on::text FROM occurrences o JOIN tasks t ON t.id=o.task_id
           WHERE o.assignee_id=$1 AND o.completed_at IS NULL AND o.due_on<=$2 ORDER BY o.due_on,o.id`, [member.id, day])).rows;
-        if (tasks.length) await this.send(member.telegram_id, `🧹 Твои невыполненные задачи (${tasks.length}):\n${tasks.slice(0,15).map(t => `• ${t.title} — ${t.due_on}`).join('\n')}\n\nОткрыть список: /tasks`, undefined, `reminder:${member.id}:${day}`);
+        if (tasks.length) await this.send(member.telegram_id, `📋 Твои невыполненные задачи (${tasks.length}):\n${tasks.slice(0,15).map(t => `• ${t.title} — ${t.due_on}`).join('\n')}\n\nОткрыть список: /tasks`, undefined, `reminder:${member.id}:${day}`);
       }
     }
   }

@@ -28,7 +28,8 @@ function adapter(db: { query: PGlite['query'] }): Database {
   return { async query<T extends QueryResultRow>(sql: string, values?: unknown[]) { return { rows: (await db.query(sql, values)).rows as T[] }; } };
 }
 before(async () => {
-  const sql = await readFile(new URL('../migrations/001_init.sql', import.meta.url), 'utf8');
+  const sql = await readFile(new URL('../migrations/001_init.sql', import.meta.url), 'utf8')
+    + '\n' + await readFile(new URL('../migrations/002_groups.sql', import.meta.url), 'utf8');
   if (process.env.TEST_DATABASE_URL) {
     pool = new pgDriver.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 5 });
     await pool.query(sql);
@@ -46,22 +47,22 @@ before(async () => {
   }
 });
 beforeEach(async () => {
-  await store.query('TRUNCATE app_users,families,processed_updates RESTART IDENTITY CASCADE');
+  await store.query('TRUNCATE app_users,task_groups,processed_updates RESTART IDENTITY CASCADE');
   await run(async s => {
     for (const [uid, name] of [['101','Максим'],['102','Елена Иванова'],['103','Алексей'],['104','Чужой']]) {
       await s.db.query('INSERT INTO app_users (telegram_id,profile_name) VALUES ($1,$2)', [uid,name]);
     }
-    a = await s.createFamily('101', 'Дом', ['101']);
+    a = await s.createGroup('101', 'Команда', ['101']);
     const code = await s.invite(a);
     await s.join('102', code); await s.join('103', code);
     b = await s.requireMember('102'); c = await s.requireMember('103');
-    outsider = await s.createFamily('104', 'Другая семья', ['104']);
+    outsider = await s.createGroup('104', 'Другая группа', ['104']);
   });
 });
 after(async () => { await pg?.close(); await pool?.end(); });
 
 async function occurrence(kind: 'once' | 'daily' = 'once') {
-  await run(s => s.createTask(a, 'Убрать кухню', a.id, { kind, start: '2026-11-08' }));
+  await run(s => s.createTask(a, 'Проверить отчёт', a.id, { kind, start: '2026-11-08' }));
   return (await run(s => s.tasks(a, a.id)))[0]!;
 }
 function message(updateId: number, text: string, uid = 101): Update {
@@ -88,7 +89,28 @@ test('date and recurrence rules cover Moscow midnight, leap years and short mont
   assert.equal(nextDue({ kind: 'once', start: '2026-11-08' }, '2026-11-08'), null);
 });
 
-test('aliases are private to the viewer and cannot cross families', async () => {
+test('group migration preserves existing memberships, assignments and private aliases', async () => {
+  const legacy = new PGlite();
+  try {
+    await legacy.exec(await readFile(new URL('../migrations/001_init.sql', import.meta.url), 'utf8'));
+    await legacy.exec(`INSERT INTO app_users (telegram_id,profile_name) VALUES (201,'Анна');
+      INSERT INTO families (name) VALUES ('Команда');
+      INSERT INTO members (family_id,telegram_id,role) VALUES (1,201,'admin');
+      INSERT INTO aliases (viewer_id,target_id,name) VALUES (1,1,'Координатор');
+      INSERT INTO tasks (family_id,title,owner_id,schedule,next_on) VALUES (1,'Отчёт',1,'{"kind":"once","start":"2026-11-08"}',NULL);
+      INSERT INTO occurrences (task_id,family_id,due_on,original_owner_id,assignee_id) VALUES (1,1,'2026-11-08',1,1);`);
+    const migration = await readFile(new URL('../migrations/002_groups.sql', import.meta.url), 'utf8');
+    await legacy.exec(migration);
+    await legacy.exec(migration);
+    assert.equal((await legacy.query<{ name: string }>('SELECT name FROM task_groups')).rows[0]!.name,'Команда');
+    assert.equal((await legacy.query<{ group_id: number }>('SELECT group_id FROM members')).rows[0]!.group_id,1);
+    assert.equal((await legacy.query<{ title: string }>('SELECT group_id,title FROM tasks')).rows[0]!.title,'Отчёт');
+    assert.equal((await legacy.query<{ assignee_id: number }>('SELECT group_id,assignee_id FROM occurrences')).rows[0]!.assignee_id,1);
+    assert.equal((await legacy.query<{ name: string }>('SELECT name FROM aliases')).rows[0]!.name,'Координатор');
+  } finally { await legacy.close(); }
+});
+
+test('aliases are private to the viewer and cannot cross groups', async () => {
   await run(s => s.alias(a, b.id, 'Мама'));
   assert.equal(await run(s => s.name(a, b.id)), 'Мама');
   assert.equal(await run(s => s.name(c, b.id)), 'Елена Иванова');
@@ -105,8 +127,8 @@ test('invitation rotation invalidates old code; admin role is not granted on joi
   await run(s => s.join('105', fresh.toLowerCase()));
   assert.equal((await run(s => s.requireMember('105'))).role, 'member');
   await assert.rejects(run(s => s.invite(b)), UserError);
-  await assert.rejects(run(s => s.createFamily('105','Вторая', ['101'])), UserError);
-  await store.query("UPDATE families SET invite_expires_at='2020-01-01' WHERE id=$1", [a.family_id]);
+  await assert.rejects(run(s => s.createGroup('105','Вторая', ['101'])), UserError);
+  await store.query("UPDATE task_groups SET invite_expires_at='2020-01-01' WHERE id=$1", [a.group_id]);
   await store.query("INSERT INTO app_users (telegram_id,profile_name) VALUES (106,'Поздний')");
   await assert.rejects(run(s => s.join('106', fresh)), UserError);
 });
@@ -144,7 +166,7 @@ test('competing help acceptances result in exactly one transfer', async () => {
   assert.equal((await store.query("SELECT id FROM events WHERE kind='transferred'")).rows.length, 1);
 });
 
-test('completion closes help, recipients and family authorization are enforced', async () => {
+test('completion closes help, recipients and group authorization are enforced', async () => {
   const t = await occurrence();
   const requestId = await run(s => s.requestHelp(a,t.id,[b.id]));
   await assert.rejects(run(s => s.acceptHelp(c,requestId)), UserError);
@@ -158,21 +180,21 @@ test('completion closes help, recipients and family authorization are enforced',
 
 test('recurrence materialization and reminders are idempotent', async () => {
   await occurrence('daily');
-  await run(s => s.materialize(a.family_id)); await run(s => s.materialize(a.family_id));
+  await run(s => s.materialize(a.group_id)); await run(s => s.materialize(a.group_id));
   assert.equal((await store.query('SELECT id FROM occurrences')).rows.length, 8);
   await run(s => s.reminders()); await run(s => s.reminders());
   assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'reminder:%'")).rows.length, 1);
 });
 
 test('a newly created task remains visible when its first deadline is far in the future', async () => {
-  await run(s => s.createTask(a,'Новогодняя уборка',b.id,{ kind: 'once',start: '2026-12-31' }));
+  await run(s => s.createTask(a,'Годовой отчёт',b.id,{ kind: 'once',start: '2026-12-31' }));
   const tasks = await run(s => s.tasks(a,b.id));
   assert.equal(tasks.length,1);
   assert.equal(tasks[0]!.due_on,'2026-12-31');
 });
 
-test('family menu, personal rename, reset and duplicate Telegram updates', async () => {
-  await update(message(10,'/family'));
+test('group menu, personal rename, reset and duplicate Telegram updates', async () => {
+  await update(message(10,'/group'));
   let payload = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
   assert.match(JSON.stringify(payload.reply_markup), /Елена Иванова/);
   await update(callback(11,`rename:${b.id}`));
@@ -180,7 +202,7 @@ test('family menu, personal rename, reset and duplicate Telegram updates', async
   await update(message(12,'Мама'));
   assert.equal(await run(s => s.name(a,b.id)), 'Мама');
   assert.equal((await store.query('SELECT id FROM outbox WHERE dedupe_key LIKE $1',['update:12:%'])).rows.length, 2);
-  await update(message(13,'/family'));
+  await update(message(13,'/group'));
   payload = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
   assert.match(JSON.stringify(payload.reply_markup), /Мама/);
   await update(callback(14,`resetname:${b.id}`));
@@ -189,7 +211,7 @@ test('family menu, personal rename, reset and duplicate Telegram updates', async
 
 test('interactive task creation survives updates and uses fixed assignment', async () => {
   await update(message(20,'/new'));
-  await update(message(21,'Помыть пол'));
+  await update(message(21,'Обновить документацию'));
   await update(callback(22,`owner:${b.id}`));
   await update(callback(23,'kind:weekly'));
   await update(message(24,'2026-11-08'));
