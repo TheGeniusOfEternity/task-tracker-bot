@@ -66,13 +66,13 @@ async function allTasks(s: Service, viewer: Member, page = 0) {
     await s.screen(viewer.telegram_id,page ? 'На этой странице задач нет.' : 'В группе пока нет созданных задач.',keyboard([nav]));
     return;
   }
-  const headers = ['ID','Задача','Исполнитель','Расписание','Срок','Статус','Выполнено','Открыто','Начало'];
+  const headers = ['Задача','Исполнитель','Расписание','Срок','Статус','Выполнено','Открыто','Начало'];
   const rows = tasks.slice(0,5).map(task => {
     const status = !task.active ? '🗑 Удалена' : task.due_on ? taskStatus({ due_on: task.due_on,completed_at: null },today).text : '🟢 Выполнена';
-    const values = [String(task.id),task.title,task.owner_name,scheduleLabel(task.schedule),task.active ? task.due_on ?? '—' : '—',status,String(task.completed_count),String(task.active ? task.pending_count : 0),task.schedule.start];
+    const values = [task.title,task.owner_name,scheduleLabel(task.schedule),task.active ? task.due_on ?? '—' : '—',status,String(task.completed_count),String(task.active ? task.pending_count : 0),task.schedule.start];
     return `<tr>${values.map(value => `<td>${escapeHtml(value)}</td>`).join('')}</tr>`;
   });
-  await s.richScreen(viewer.telegram_id,`<h3>📋 Все задачи · страница ${page+1}</h3><table><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr>${rows.join('')}</table>`,keyboard([nav]));
+  await s.richScreen(viewer.telegram_id,`<table><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr>${rows.join('')}</table>`,keyboard([nav]));
 }
 async function settings(s: Service, viewer: Member, saved = false) {
   const group = await s.reminderSettings(viewer);

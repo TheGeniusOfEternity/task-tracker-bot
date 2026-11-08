@@ -516,8 +516,8 @@ test('late completion covers skipped cycles even without cron and resumes future
   // No cron or listing between November and January: January's calendar date is already covered.
   await runAt('2027-01-05',s => s.complete(a,first));
   assert.equal((await store.query('SELECT next_on::text FROM tasks WHERE id=$1',[taskId])).rows[0]!.next_on,'2027-02-06');
-  assert.equal((await runAt('2027-01-05',s => s.tasks(a,a.id))).length,0);
-  assert.equal((await runAt('2027-02-05',s => s.tasks(a,a.id))).length,0);
+  assert.equal((await runAt('2027-01-05',s => s.tasks(a,a.id)))[0]!.due_on,'2027-02-06');
+  assert.equal((await runAt('2027-02-05',s => s.tasks(a,a.id)))[0]!.due_on,'2027-02-06');
   const next = await runAt('2027-02-06',s => s.tasks(a,a.id));
   assert.equal(next.length,1); assert.equal(next[0]!.due_on,'2027-02-06');
   assert.notEqual(next[0]!.id,first);
@@ -932,7 +932,7 @@ test('admin panel contains history and all tasks while ordinary members cannot a
   assert.match((await store.query("SELECT payload FROM outbox WHERE dedupe_key='error:2205:0'")).rows[0]!.payload.text,/администратору/);
 });
 
-test('all tasks includes each template once with completion counts, deleted tasks and personal names', async () => {
+test('all tasks includes each active template once with completion counts and personal names', async () => {
   await run(s => s.alias(a,b.id,'Коллега <&>'));
   const once = await run(s => s.createTask(b,'Задача <&> с полным названием',b.id,{ kind: 'once',start: '2026-11-08' }));
   const occurrenceId = (await store.query('SELECT id FROM occurrences WHERE task_id=$1',[once])).rows[0]!.id;
@@ -945,7 +945,7 @@ test('all tasks includes each template once with completion counts, deleted task
   const work = await otherBot();
   await runFor('work',s => s.createTask(work.admin,'Чужой бот',work.admin.id,{ kind: 'once',start: '2026-11-08' }));
   const tasks = await run(s => s.allCreatedTasks(a));
-  assert.equal(tasks.length,3); assert.equal(tasks.filter(t => t.id === daily).length,1);
+  assert.equal(tasks.length,2); assert.equal(tasks.filter(t => t.id === daily).length,1);
   assert.equal(tasks.find(t => t.id === daily)!.pending_count,8);
   assert.equal(tasks.find(t => t.id === once)!.completed_count,1);
   assert.equal(tasks.find(t => t.id === once)!.owner_name,'Коллега <&>');
@@ -955,9 +955,9 @@ test('all tasks includes each template once with completion counts, deleted task
   const job = (await store.query("SELECT method,payload FROM outbox WHERE dedupe_key='update:2220:0'")).rows[0]!;
   assert.equal(job.method,'sendRichMessage');
   const html = job.payload.rich_message.html;
-  assert.match(html,/<table><tr><th>ID/); assert.equal((html.match(/<tr>/g) ?? []).length,4);
+  assert.match(html,/^<table><tr><th>Задача/); assert.doesNotMatch(html,/<h3>|<th>ID/); assert.equal((html.match(/<tr>/g) ?? []).length,3);
   assert.match(html,/Задача &lt;&amp;&gt; с полным названием/);
-  assert.match(html,/Коллега &lt;&amp;&gt;/); assert.match(html,/Удалена/); assert.match(html,/Выполнена/);
+  assert.match(html,/Коллега &lt;&amp;&gt;/); assert.doesNotMatch(html,/Удалённая|Удалена/); assert.match(html,/Выполнена/);
   assert.doesNotMatch(html,/Чужая группа|Чужой бот/);
 });
 
@@ -990,6 +990,60 @@ test('rich table screens replace ordinary screens and are retired when returning
   assert.deepEqual(deleted,[3000,3001]);
   const latest = (await store.query("SELECT method,payload FROM outbox WHERE payload->>'__screen'='true' AND payload->>'__retired'='false'")).rows;
   assert.equal(latest.length,1); assert.equal(latest[0]!.method,'sendMessage');
+});
+
+test('completing a daily task keeps the series and displays tomorrow with a blue marker', async () => {
+  let id = 2300;
+  const cb = (data: string) => update(callback(id++,data,102));
+  await cb('new'); await update(message(id++,'Ежедневная проверка',102));
+  await cb('taskdaysall'); await cb('taskdaysdone'); await cb('period:weekly'); await cb('createtask');
+  const task = (await store.query('SELECT id,schedule FROM tasks')).rows[0]!;
+  assert.equal(task.schedule.kind,'daily'); assert.equal(task.schedule.overdue,'weekends');
+  const first = (await run(s => s.tasks(b,b.id)))[0]!;
+  await cb('mine');
+  let view = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  assert.match(view.reply_markup.inline_keyboard[0][0].text,/^🟡 Ежедневная проверка · 2026-11-08$/);
+  await cb(`done:${first.id}`); await cb('mine');
+  view = (await store.query("SELECT payload FROM outbox WHERE method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  assert.match(view.reply_markup.inline_keyboard[0][0].text,/^🔵 Ежедневная проверка · 2026-11-09$/);
+  assert.equal((await store.query('SELECT active FROM tasks WHERE id=$1',[task.id])).rows[0]!.active,true);
+  assert.equal((await store.query('SELECT id FROM occurrences WHERE task_id=$1 AND completed_at IS NULL',[task.id])).rows.length,1);
+  assert.equal((await store.query('SELECT id FROM occurrences WHERE task_id=$1 AND completed_at IS NOT NULL',[task.id])).rows.length,1);
+  await Promise.all([run(s => s.materialize(b.group_id)),run(s => s.materialize(b.group_id))]);
+  assert.equal((await run(s => s.tasks(b,b.id))).length,1);
+});
+
+test('undo retires only an untouched future preview and retains a transferred owner and history', async () => {
+  const taskId = await run(s => s.createTask(a,'Повтор',a.id,{ kind: 'daily',start: '2026-11-08',overdue: 'weekends' }));
+  const first = (await run(s => s.tasks(a,a.id)))[0]!;
+  const request = await run(s => s.requestHelp(a,first.id,[b.id]));
+  await run(s => s.acceptHelp(b,request)); await run(s => s.complete(b,first.id));
+  const future = (await run(s => s.tasks(a,a.id)))[0]!;
+  assert.equal(future.due_on,'2026-11-09'); assert.equal(future.assignee_id,a.id);
+  await run(s => s.complete(b,first.id,true));
+  assert.equal((await run(s => s.tasks(a,a.id))).length,0);
+  const reopened = (await run(s => s.tasks(b,b.id)))[0]!;
+  assert.equal(reopened.id,first.id); assert.equal(reopened.assignee_id,b.id);
+  assert.equal((await store.query('SELECT id FROM events WHERE occurrence_id=$1',[first.id])).rows.length,4);
+  await run(s => s.complete(b,first.id));
+  const next = (await run(s => s.tasks(a,a.id)))[0]!;
+  assert.equal(next.due_on,'2026-11-09');
+  await run(s => s.requestHelp(a,next.id,[c.id]));
+  await assert.rejects(run(s => s.complete(b,first.id,true)),/следующий цикл/);
+  assert.equal((await store.query('SELECT id FROM occurrences WHERE task_id=$1 AND completed_at IS NULL',[taskId])).rows.length,1);
+  assert.equal((await store.query("SELECT id FROM help_requests WHERE occurrence_id=$1 AND state='pending'",[next.id])).rows.length,1);
+});
+
+test('future previews follow leap days and skip missed dates after late completion', async () => {
+  const taskId = await runAt('2028-02-28',s => s.createTask(a,'Календарь',a.id,{ kind: 'daily',start: '2028-02-28',overdue: 'weekends' }));
+  const first = (await runAt('2028-02-28',s => s.tasks(a,a.id)))[0]!;
+  await runAt('2028-02-28',s => s.complete(a,first.id));
+  const leap = (await runAt('2028-02-28',s => s.tasks(a,a.id)))[0]!;
+  assert.equal(leap.due_on,'2028-02-29');
+  await runAt('2028-03-04',s => s.complete(a,leap.id));
+  const next = (await runAt('2028-03-04',s => s.tasks(a,a.id)))[0]!;
+  assert.equal(next.due_on,'2028-03-05');
+  assert.equal((await store.query('SELECT id FROM occurrences WHERE task_id=$1 AND completed_at IS NULL',[taskId])).rows.length,1);
 });
 
 test('a draft confirmed on a later day refreshes its automatic deadline before creation', async () => {

@@ -135,12 +135,13 @@ export class Service {
     const today = localDay(this.now, group.timezone);
     const through = addDays(today, 7);
     const tasks = (await this.db.query<{ id: number; owner_id: number; schedule: Schedule; next_on: string }>(
-      `SELECT id,owner_id,schedule,next_on::text FROM tasks WHERE group_id=$1 AND active AND next_on<=$2 ORDER BY id FOR UPDATE`, [groupId, through])).rows;
+      `SELECT id,owner_id,schedule,next_on::text FROM tasks WHERE group_id=$1 AND active AND next_on IS NOT NULL AND (next_on<=$2 OR
+        (schedule->>'overdue'='weekends' AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.task_id=tasks.id AND o.completed_at IS NULL))) ORDER BY id FOR UPDATE`, [groupId, through])).rows;
     for (const task of tasks) {
       let day: string | null = task.next_on;
       if (task.schedule.overdue === 'weekends') {
         let pending = (await this.db.query('SELECT id FROM occurrences WHERE task_id=$1 AND completed_at IS NULL', [task.id])).rows.length > 0;
-        // Only due cycles can open. Missed cycles advance the calendar, never duplicate the pending task.
+        // Missed cycles advance the calendar without duplicating a pending task. Keep the next future occurrence visible.
         for (let i = 0; day && day <= today && i < 500; i++) {
           if (!pending) {
             await this.db.query(`INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id,coalesced)
@@ -148,6 +149,11 @@ export class Service {
             pending = true;
           }
           day = nextDue(task.schedule, day);
+        }
+        if (!pending && day) {
+          await this.db.query(`INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id,coalesced)
+            VALUES ($1,$2,$3,$4,$4,true) ON CONFLICT DO NOTHING`,[task.id,groupId,day,task.owner_id]);
+          day = nextDue(task.schedule,day);
         }
         await this.db.query('UPDATE tasks SET next_on=$1 WHERE id=$2', [day, task.id]);
         continue;
@@ -206,8 +212,15 @@ export class Service {
     if (undo && task.completed_by !== viewer.id) throw new UserError('Отменить можно только свою отметку.');
     if (task.schedule.overdue === 'weekends') {
       if (undo) {
-        const pending = await this.db.query('SELECT id FROM occurrences WHERE task_id=$1 AND id<>$2 AND completed_at IS NULL', [task.task_id, id]);
-        if (pending.rows.length) throw new UserError('Нельзя отменить отметку: уже начался следующий цикл задачи.');
+        const today = await this.today(viewer);
+        const pending = (await this.db.query<{ id: number; due_on: string; untouched: boolean }>(`SELECT o.id,o.due_on::text,
+          (o.assignee_id=o.original_owner_id AND NOT EXISTS (SELECT 1 FROM events e WHERE e.occurrence_id=o.id)
+            AND NOT EXISTS (SELECT 1 FROM help_requests h WHERE h.occurrence_id=o.id)) AS untouched
+          FROM occurrences o WHERE o.task_id=$1 AND o.id<>$2 AND o.completed_at IS NULL ORDER BY o.id FOR UPDATE`,[task.task_id,id])).rows;
+        if (pending.some(next => next.due_on<=today || !next.untouched)) throw new UserError('Нельзя отменить отметку: уже начался следующий цикл задачи или по нему есть действия.');
+        // Only retire an untouched future preview, never a cycle with work or history.
+        for (const next of pending) await this.db.query('DELETE FROM occurrences WHERE id=$1',[next.id]);
+        if (pending.length) await this.db.query('UPDATE tasks SET next_on=$1 WHERE id=$2',[pending[0]!.due_on,task.task_id]);
       } else {
         // A late completion covers all calendar dates up to completion, including cycles not yet materialized.
         const today = await this.today(viewer);
@@ -279,7 +292,7 @@ export class Service {
       CROSS JOIN LATERAL (SELECT min(o.due_on) FILTER (WHERE o.completed_at IS NULL) AS due_on,
         count(*) FILTER (WHERE o.completed_at IS NOT NULL)::int AS completed_count,
         count(*) FILTER (WHERE o.completed_at IS NULL)::int AS pending_count FROM occurrences o WHERE o.task_id=t.id) stats
-      WHERE t.group_id=$2 AND g.bot_id=$3 ORDER BY t.id DESC LIMIT 6 OFFSET $4`,[admin.id,admin.group_id,this.botId,Math.max(0,Math.min(10000,page))*5])).rows;
+      WHERE t.group_id=$2 AND g.bot_id=$3 AND t.active ORDER BY t.id DESC LIMIT 6 OFFSET $4`,[admin.id,admin.group_id,this.botId,Math.max(0,Math.min(10000,page))*5])).rows;
   }
   async history(viewer: Member) {
     this.admin(viewer);
