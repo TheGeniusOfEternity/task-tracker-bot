@@ -19,7 +19,7 @@ try {
       { command: 'tasks', description: 'Мои задачи' },
       { command: 'group', description: 'Группа и личные имена' },
       { command: 'history', description: 'Журнал за неделю' },
-      { command: 'new', description: 'Создать задачу (админ)' },
+      { command: 'new', description: 'Создать задачу' },
       { command: 'join', description: 'Вступить по коду' },
       { command: 'cancel', description: 'Отменить текущее действие' },
     ]);

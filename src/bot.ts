@@ -13,8 +13,8 @@ const cancelHint = '\n\n«🏠 Меню» отменит текущее дейс
 function navigationKeyboard(member?: Member) {
   const result = new InlineKeyboard();
   if (member) {
-    result.text('📋 Мои задачи','mine').row().text('👥 Группа','group').row().text('📖 Журнал','history');
-    if (member.role === 'admin') result.row().text('➕ Создать задачу','new').row().text('🔗 Приглашение','invite').row().text('⚙️ Настройки','settings');
+    result.text('📋 Мои задачи','mine').row().text('👥 Группа','group').row().text('📖 Журнал','history').row().text('➕ Создать задачу','new');
+    if (member.role === 'admin') result.row().text('🔗 Приглашение','invite').row().text('⚙️ Настройки','settings');
   } else result.text('🏠 Меню','menu');
   return result;
 }
@@ -86,7 +86,7 @@ async function taskCard(s: Service, viewer: Member, occurrenceId: number) {
   if (t.assignee_id === viewer.id) {
     if (t.completed_at) rows.push([button('↩️ Отменить отметку', `undo:${t.id}`)]);
     else {
-      rows.push([button('✅ Выполнено', `done:${t.id}`)]);
+      if (!t.help_pending) rows.push([button('✅ Выполнено', `done:${t.id}`)]);
       rows.push([t.help_pending ? button('🚫 Отменить просьбу о помощи',`cancelhelp:${t.id}`) : button('🙋 Попросить помощи',`help:${t.id}`)]);
     }
   }
@@ -130,7 +130,6 @@ async function ownerPicker(s: Service, viewer: Member, session: Session) {
   ]));
 }
 async function newTask(s: Service, viewer: Member) {
-  s.admin(viewer);
   await titlePicker(s,viewer,{ step: 'task_title' });
 }
 async function daysPicker(s: Service, viewer: Member, session: Session, messageId?: number) {
@@ -158,7 +157,7 @@ async function ordinalPicker(s: Service, viewer: Member, session: Session) {
 async function taskBack(s: Service, viewer: Member, session: Session) {
   switch (session.step) {
     case 'task_owner': return titlePicker(s,viewer,session);
-    case 'task_days': return ownerPicker(s,viewer,session);
+    case 'task_days': return viewer.role === 'admin' ? ownerPicker(s,viewer,session) : titlePicker(s,viewer,session);
     case 'task_period': return daysPicker(s,viewer,session);
     case 'task_date': return confirmTask(s,viewer,session);
     case 'task_ordinal': case 'task_overdue': return periodPicker(s,viewer,session);
@@ -190,10 +189,11 @@ async function textInput(s: Service, uid: string, text: string) {
     await s.alias(viewer, Number(session.target), text); await s.saveSession(uid);
     await s.screen(uid, 'Имя сохранено только для тебя.'); await memberCard(s, viewer, Number(session.target)); return;
   }
-  s.admin(viewer);
   if (session.step === 'task_title') {
     if (!text.trim() || text.length > 160) throw new UserError('Название должно содержать от 1 до 160 символов.');
-    await ownerPicker(s,viewer,{ ...session,title: text.trim() });
+    const next = { ...session,title: text.trim() };
+    if (viewer.role === 'admin') await ownerPicker(s,viewer,next);
+    else await daysPicker(s,viewer,{ ...next,owner: viewer.id,weekdays: session.weekdays ?? [] });
   } else if (session.step === 'task_date') {
     if (!validDay(text) || text < await s.today(viewer) || text > '2100-12-31') throw new UserError('Введи дату от сегодняшнего дня до 2100 года в формате ГГГГ-ММ-ДД.');
     await confirmTask(s,viewer,{ ...session,manualStart: text });
@@ -319,7 +319,7 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
           const next = { ...session,owner: target.id };
           await daysPicker(s,viewer,{ ...next,weekdays: session.weekdays ?? [] });
         } else if (action === 'taskday' || action === 'taskdaysall' || action === 'taskdaysdone') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_days');
+          const session = await s.session(uid); requireStep(session,'task_days');
           let selected = session.weekdays as number[];
           if (action === 'taskdaysdone') {
             if (!selected.length) throw new UserError('Выбери хотя бы один день недели.');
@@ -330,46 +330,46 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
             await daysPicker(s,viewer,{ ...session,weekdays: selected.sort((a,b) => a - b) },ctx.callbackQuery.message?.message_id);
           }
         } else if (action === 'taskback') {
-          s.admin(viewer); const session = await s.session(uid);
+          const session = await s.session(uid);
           if (!session?.step.startsWith('task_')) throw new UserError('Эта кнопка устарела.');
           await taskBack(s,viewer,session);
         } else if (action === 'taskdate') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_confirm');
+          const session = await s.session(uid); requireStep(session,'task_confirm');
           await askStart(s,viewer,session);
         } else if (action === 'taskdateauto') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_date');
+          const session = await s.session(uid); requireStep(session,'task_date');
           const next = { ...session }; delete next.manualStart; await periodPicker(s,viewer,next);
         } else if (action === 'backdays') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_period'); await daysPicker(s,viewer,session);
+          const session = await s.session(uid); requireStep(session,'task_period'); await daysPicker(s,viewer,session);
         } else if (action === 'backperiod') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_ordinal'); await periodPicker(s,viewer,session);
+          const session = await s.session(uid); requireStep(session,'task_ordinal'); await periodPicker(s,viewer,session);
         } else if (action === 'period') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session,'task_period');
+          const session = await s.session(uid); requireStep(session,'task_period');
           if (arg === 'once') await confirmTask(s,viewer,{ ...session,kind: 'once' });
           else if (arg === 'weekly') await confirmTask(s,viewer,{ ...session,kind: (session.weekdays as number[]).length === 7 ? 'daily' : 'weekly' });
           else if (arg === 'monthly') {
             await ordinalPicker(s,viewer,{ ...session,kind: 'monthly_weekday' });
           } else throw new UserError('Выбери «Без повтора», «Еженедельно» или «Ежемесячно».');
         } else if (action === 'kind') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_kind');
+          const session = await s.session(uid); requireStep(session, 'task_kind');
           await daysPicker(s,viewer,{ ...session,weekdays: [] });
         } else if (action === 'ordinal') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_ordinal');
+          const session = await s.session(uid); requireStep(session, 'task_ordinal');
           const ordinal = Number(arg);
           if (![1,2,3,4,-1].includes(ordinal)) throw new UserError('Выбери порядковый номер кнопкой.');
           if (session.weekdays) await confirmTask(s,viewer,{ ...session,ordinal });
           else await daysPicker(s,viewer,{ ...session,weekdays: [] });
         } else if (action === 'monthweekday') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_month_weekday');
+          const session = await s.session(uid); requireStep(session, 'task_month_weekday');
           const weekday = id(arg);
           if (weekday > 7) throw new UserError('Выбери день недели кнопкой.');
           await confirmTask(s,viewer,{ ...session,weekday });
         } else if (action === 'overdue') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_overdue');
+          const session = await s.session(uid); requireStep(session, 'task_overdue');
           if (arg !== 'daily' && arg !== 'weekends') throw new UserError('Выбери режим просрочки кнопкой.');
           await periodPicker(s, viewer, { ...session, overdue: arg });
         } else if (action === 'createtask') {
-          s.admin(viewer); const session = await s.session(uid); requireStep(session, 'task_confirm');
+          const session = await s.session(uid); requireStep(session, 'task_confirm');
           if (!session.manualStart && session.calculatedOn !== await s.today(viewer)) {
             await confirmTask(s,viewer,session);
           } else {

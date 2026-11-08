@@ -108,18 +108,19 @@ export class Service {
     if (!group) throw new UserError('Группа не найдена у этого бота.');
     return localDay(this.now, group.timezone);
   }
-  async createTask(admin: Member, title: string, ownerId: number, schedule: Schedule) {
-    this.admin(admin);
-    await this.target(admin, ownerId);
+  async createTask(creator: Member, title: string, ownerId: number, schedule: Schedule) {
+    this.assertMember(creator);
+    if (creator.role !== 'admin' && ownerId !== creator.id) throw new UserError('Можно создавать задачи только себе. Назначать другим может администратор.');
+    await this.target(creator, ownerId);
     if (!title.trim() || title.trim().length > 160) throw new UserError('Название задачи: от 1 до 160 символов.');
     const first = firstDue(schedule);
     const task = (await this.db.query<{ id: number }>(`INSERT INTO tasks (group_id,title,owner_id,schedule,next_on)
-      VALUES ($1,$2,$3,$4,$5) RETURNING id`, [admin.group_id, title.trim(), ownerId, JSON.stringify(schedule), nextDue(schedule, first)])).rows[0]!;
+      VALUES ($1,$2,$3,$4,$5) RETURNING id`, [creator.group_id, title.trim(), ownerId, JSON.stringify(schedule), nextDue(schedule, first)])).rows[0]!;
     // Always expose the first occurrence, even when its date is beyond the rolling horizon.
     await this.db.query(`INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id,coalesced)
-      VALUES ($1,$2,$3,$4,$4,$5)`, [task.id, admin.group_id, first, ownerId, schedule.overdue === 'weekends']);
-    await this.materialize(admin.group_id);
-    const owner = await this.target(admin, ownerId);
+      VALUES ($1,$2,$3,$4,$4,$5)`, [task.id, creator.group_id, first, ownerId, schedule.overdue === 'weekends']);
+    await this.materialize(creator.group_id);
+    const owner = await this.target(creator, ownerId);
     await this.send(owner.telegram_id, `📋 Тебе назначена задача: ${title.trim()}\nНачало: ${schedule.start}\nПосмотреть: /tasks`, undefined, `task-created:${task.id}`);
     return task.id;
   }

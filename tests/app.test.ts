@@ -160,7 +160,7 @@ test('fresh and repeated joins give ordinary members role-appropriate inline men
     assert.equal(reply.reply_markup.keyboard,undefined);
     const labels = reply.reply_markup.inline_keyboard.flat().map((button: { text: string }) => button.text);
     assert.ok(labels.includes('👥 Группа'));
-    assert.equal(labels.includes('➕ Создать задачу'),false);
+    assert.equal(labels.includes('➕ Создать задачу'),true);
     assert.equal(labels.includes('🔗 Приглашение'),false);
   }
   assert.equal((await run(s => s.requireMember('105'))).role,'member');
@@ -174,7 +174,7 @@ test('inline navigation exits a wizard and admin-only buttons remain protected',
   assert.equal((await store.query('SELECT id FROM tasks')).rows.length,0);
   const groupView = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:954:0'")).rows[0]!.payload;
   assert.match(groupView.text,/Участники группы/);
-  await update(callback(955,'new',102));
+  await update(callback(955,'invite',102));
   const denied = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='error:955:0'")).rows[0]!.payload;
   assert.match(denied.text,/администратору/);
   assert.equal(denied.show_alert,true);
@@ -702,10 +702,15 @@ test('task card offers either request help or cancel help and updates immediatel
   assert.ok(actions(await card()).includes(`help:${t.id}`));
   assert.equal(actions(await card()).includes(`cancelhelp:${t.id}`),false);
   assert.equal((await card()).reply_markup.inline_keyboard.at(-1)[0].text,'⬅️ Назад');
-  await cb(`help:${t.id}`); await cb(`pickhelp:${b.id}`); await cb('sendhelp');
+  assert.ok(actions(await card()).includes(`done:${t.id}`));
+  await cb(`help:${t.id}`);
+  assert.equal(actions(await card()).includes(`done:${t.id}`),false);
+  await cb(`pickhelp:${b.id}`); await cb('sendhelp');
   assert.ok(actions(await card()).includes(`cancelhelp:${t.id}`));
+  assert.equal(actions(await card()).includes(`done:${t.id}`),false);
   assert.equal(actions(await card()).includes(`help:${t.id}`),false);
   await cb(`cancelhelp:${t.id}`);
+  assert.ok(actions(await card()).includes(`done:${t.id}`));
   assert.ok(actions(await card()).includes(`help:${t.id}`));
   assert.equal(actions(await card()).includes(`cancelhelp:${t.id}`),false);
   await cb(`done:${t.id}`);
@@ -863,6 +868,50 @@ test('Vercel has one daily trigger for each hour without a subdaily Hobby expres
   assert.equal(config.crons.length,24);
   assert.deepEqual(config.crons.map((c: { schedule: string }) => c.schedule),Array.from({ length: 24 },(_,h) => `0 ${h} * * *`));
   assert.ok(config.crons.every((c: { path: string }) => c.path === '/api/cron'));
+});
+
+test('ordinary members create their own tasks without an assignee step and can navigate back', async () => {
+  let id = 2000;
+  const cb = (data: string) => update(callback(id++,data,102));
+  const text = (value: string) => update(message(id++,value,102));
+  await cb('new'); await text('Личная проверка');
+  let session = (await run(s => s.session('102')))!;
+  assert.equal(session.step,'task_days'); assert.equal(session.owner,b.id);
+  await cb('taskday:1'); await cb('taskback');
+  assert.equal((await run(s => s.session('102')))?.step,'task_title');
+  await text('Обновлённая проверка');
+  assert.deepEqual((await run(s => s.session('102')))?.weekdays,[1]);
+  await cb('taskdaysdone'); await cb('period:monthly'); await cb('ordinal:1');
+  await cb('taskdate'); await text('2026-12-01');
+  session = (await run(s => s.session('102')))!;
+  assert.equal(session.step,'task_confirm'); assert.equal(session.owner,b.id);
+  await cb('createtask');
+  const task = (await store.query('SELECT title,owner_id,schedule FROM tasks')).rows[0]!;
+  assert.equal(task.title,'Обновлённая проверка'); assert.equal(task.owner_id,b.id);
+  assert.equal(task.schedule.kind,'monthly_weekday'); assert.equal(task.schedule.start,'2026-12-01');
+  const occurrence = (await store.query('SELECT original_owner_id,assignee_id,due_on::text FROM occurrences')).rows[0]!;
+  assert.equal(occurrence.assignee_id,b.id); assert.equal(occurrence.original_owner_id,b.id);
+  assert.equal(occurrence.due_on,'2026-12-07');
+});
+
+test('self creation cannot assign to another member, group or bot through forged callbacks', async () => {
+  await assert.rejects(run(s => s.createTask(b,'Чужая задача',a.id,{ kind: 'once',start: '2026-11-09' })),UserError);
+  await assert.rejects(run(s => s.createTask(b,'Другая группа',outsider.id,{ kind: 'once',start: '2026-11-09' })),UserError);
+  await otherBot();
+  await assert.rejects(runFor('work',s => s.createTask(b,'Другой бот',b.id,{ kind: 'once',start: '2026-11-09' })),UserError);
+  await update(callback(2100,'new',102)); await update(message(2101,'Проверка прав',102));
+  await update(callback(2102,`owner:${a.id}`,102));
+  assert.equal((await run(s => s.session('102')))?.owner,b.id);
+  await update(callback(2103,'taskday:1',102)); await update(callback(2104,'taskdaysdone',102));
+  await update(callback(2105,'period:once',102));
+  const session = (await run(s => s.session('102')))!;
+  await run(s => s.saveSession('102',{ ...session,owner: a.id }));
+  await update(callback(2106,'createtask',102));
+  assert.equal((await store.query('SELECT id FROM tasks')).rows.length,0);
+  assert.equal((await store.query("SELECT payload FROM outbox WHERE dedupe_key='error:2106:0'")).rows[0]!.payload.show_alert,true);
+  await run(s => s.createTask(b,'Своя задача',b.id,{ kind: 'once',start: '2026-11-09' }));
+  await run(s => s.createTask(a,'Назначенная задача',c.id,{ kind: 'once',start: '2026-11-09' }));
+  assert.deepEqual((await store.query('SELECT owner_id FROM tasks ORDER BY id')).rows.map(r => r.owner_id),[b.id,c.id]);
 });
 
 test('a draft confirmed on a later day refreshes its automatic deadline before creation', async () => {
