@@ -138,6 +138,65 @@ test('group creation leaves the invitation visible until the user opens the menu
   assert.equal(messages[0]!.payload.reply_markup.inline_keyboard[1][0].callback_data,'menu');
 });
 
+test('opening an invite as an existing member shows a persistent menu without changing groups', async () => {
+  const anotherGroupCode = await run(s => s.invite(outsider));
+  await update(message(950,`/start join_${anotherGroupCode}`));
+  const reply = (await store.query("SELECT payload FROM outbox WHERE dedupe_key LIKE 'update:950:%' AND method='sendMessage'")).rows[0]!.payload;
+  assert.match(reply.text,/Ты уже состоишь в группе/);
+  assert.equal(reply.reply_markup.is_persistent,true);
+  assert.equal(reply.reply_markup.resize_keyboard,true);
+  const labels = reply.reply_markup.keyboard.flat().map((button: { text: string }) => button.text);
+  for (const label of ['📋 Мои задачи','👥 Группа','📖 Журнал','🏠 Меню','➕ Создать задачу','🔗 Приглашение']) assert.ok(labels.includes(label));
+  assert.equal((await run(s => s.requireMember('101'))).group_id,a.group_id);
+  assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'error:950:%'")).rows.length,0);
+});
+
+test('fresh and repeated joins give ordinary members role-appropriate keyboards', async () => {
+  const code = await run(s => s.invite(a));
+  await update(message(951,`/start join_${code}`,105));
+  for (const updateId of [951,952]) {
+    if (updateId === 952) await update(message(952,`/join ${code}`,105));
+    const reply = (await store.query("SELECT payload FROM outbox WHERE dedupe_key LIKE $1 AND method='sendMessage'",[`update:${updateId}:%`])).rows[0]!.payload;
+    assert.equal(reply.reply_markup.is_persistent,true);
+    const labels = reply.reply_markup.keyboard.flat().map((button: { text: string }) => button.text);
+    assert.ok(labels.includes('👥 Группа'));
+    assert.equal(labels.includes('➕ Создать задачу'),false);
+    assert.equal(labels.includes('🔗 Приглашение'),false);
+  }
+  assert.equal((await run(s => s.requireMember('105'))).role,'member');
+});
+
+test('persistent keyboard navigation exits a wizard and admin-only buttons remain protected', async () => {
+  await update(message(953,'➕ Создать задачу'));
+  assert.equal((await run(s => s.session('101')))?.step,'task_title');
+  await update(message(954,'👥 Группа'));
+  assert.equal(await run(s => s.session('101')),undefined);
+  assert.equal((await store.query('SELECT id FROM tasks')).rows.length,0);
+  const groupView = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:954:0'")).rows[0]!.payload;
+  assert.match(groupView.text,/Участники группы/);
+  await update(message(955,'➕ Создать задачу',102));
+  const denied = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='error:955:0'")).rows[0]!.payload;
+  assert.match(denied.text,/администратору/);
+  assert.equal(denied.reply_markup.is_persistent,true);
+  await update(message(956,'➕ Создать задачу'));
+  await update(message(957,'✖️ Отмена'));
+  assert.equal(await run(s => s.session('101')),undefined);
+  const cancelled = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:957:0'")).rows[0]!.payload;
+  assert.match(cancelled.text,/Действие отменено/);
+  assert.equal(cancelled.reply_markup.is_persistent,true);
+});
+
+test('an invalid invite leaves a guest with a working menu button', async () => {
+  await update(message(958,'/start join_INVALID',105));
+  assert.equal(await run(s => s.member('105')),undefined);
+  const error = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='error:958:0'")).rows[0]!.payload;
+  assert.match(error.text,/Код не найден/);
+  assert.equal(error.reply_markup.keyboard[0][0].text,'🏠 Меню');
+  await update(message(959,'🏠 Меню',105));
+  const menu = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:959:0'")).rows[0]!.payload;
+  assert.match(menu.text,/Открой ссылку-приглашение/);
+});
+
 test('new screens delete previous bot screens after successful delivery, retaining notifications', async () => {
   await run(s => s.screen('101','Первый экран'));
   await run(s => s.send('101','Важное уведомление'));

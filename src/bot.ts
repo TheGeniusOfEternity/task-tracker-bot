@@ -1,4 +1,4 @@
-import { Bot, BotError, InlineKeyboard } from 'grammy';
+import { Bot, BotError, InlineKeyboard, Keyboard } from 'grammy';
 import type { Update, UserFromGetMe } from 'grammy/types';
 import type { Store } from './db.js';
 import { Service, type Member, type Session } from './service.js';
@@ -10,19 +10,33 @@ const labels: Record<string, string> = { completed: '✅ Выполнено', re
 const keyboard = (rows: { text: string; callback_data: string }[][]) => ({ inline_keyboard: rows });
 const button = (text: string, data: string) => ({ text, callback_data: data });
 const cancelHint = '\n\nОтменить: /cancel';
+const navigation = { menu: '🏠 Меню',tasks: '📋 Мои задачи',group: '👥 Группа',history: '📖 Журнал',create: '➕ Создать задачу',invite: '🔗 Приглашение',cancel: '✖️ Отмена' } as const;
+function navigationKeyboard(member?: Member) {
+  const result = new Keyboard();
+  if (member) {
+    result.text(navigation.tasks).text(navigation.group).row().text(navigation.history).text(navigation.menu);
+    if (member.role === 'admin') result.row().text(navigation.create).text(navigation.invite);
+    result.row().text(navigation.cancel);
+  } else result.text(navigation.menu);
+  return result.persistent().resized();
+}
 function id(value: string | undefined) {
   if (!value || !/^[1-9]\d{0,9}$/.test(value)) throw new UserError('Некорректная кнопка. Открой меню заново: /start');
   return Number(value);
 }
-async function main(s: Service, uid: string) {
+async function main(s: Service, uid: string, notice?: string) {
   const member = await s.member(uid);
   if (!member) {
-    await s.screen(uid, '📋 Трекер задач\nОткрой ссылку-приглашение от администратора или введи /join КОД.\nАдминистратор бота может создать группу: /create Название\nТвой Telegram ID: /id');
+    await s.screen(uid, '📋 Трекер задач\nОткрой ссылку-приглашение от администратора или введи /join КОД.\nАдминистратор бота может создать группу: /create Название\nТвой Telegram ID: /id',navigationKeyboard());
     return;
   }
-  const menu = new InlineKeyboard().text('📋 Мои задачи', 'mine').row().text('👥 Группа', 'group').row().text('📖 Журнал', 'history');
-  if (member.role === 'admin') menu.row().text('➕ Создать задачу', 'new').row().text('🔗 Новая ссылка-приглашение', 'invite');
-  await s.screen(uid, 'Что хочешь сделать?', menu);
+  await s.screen(uid, `${notice ? `${notice}\n\n` : ''}Выбери раздел на клавиатуре под полем ввода.`,navigationKeyboard(member));
+}
+async function joinAndOpenMenu(s: Service, uid: string, code: string) {
+  await s.saveSession(uid);
+  if (await s.member(uid)) { await main(s,uid,'Ты уже состоишь в группе.'); return; }
+  await s.join(uid,code);
+  await main(s,uid,'Ты присоединился к группе.');
 }
 async function group(s: Service, viewer: Member) {
   const members = await s.members(viewer);
@@ -101,7 +115,7 @@ async function textInput(s: Service, uid: string, text: string) {
   const session = await s.session(uid);
   if (!session) { await main(s, uid); return; }
   if (session.step === 'join') {
-    await s.join(uid, text); await s.saveSession(uid); await s.screen(uid, 'Ты присоединился к группе.'); await main(s, uid); return;
+    await joinAndOpenMenu(s,uid,text); return;
   }
   const viewer = await s.requireMember(uid);
   if (session.step === 'rename') {
@@ -163,15 +177,15 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
     bot.command('id', async () => { await s.screen(uid, `Твой Telegram ID: ${uid}`); });
     bot.command('start', async ctx => {
       await s.saveSession(uid);
-      if (ctx.match.startsWith('join_')) { await s.join(uid, ctx.match.slice(5)); await s.screen(uid, 'Ты присоединился к группе.'); }
-      await main(s, uid);
+      if (ctx.match.startsWith('join_')) await joinAndOpenMenu(s,uid,ctx.match.slice(5));
+      else await main(s, uid);
     });
     bot.command('create', async ctx => {
       const viewer = await s.createGroup(uid, ctx.match, options.adminIds);
       await invite(s,viewer,ctx.me.username,true);
     });
     bot.command('join', async ctx => {
-      if (ctx.match) { await s.join(uid, ctx.match); await s.saveSession(uid); await main(s, uid); }
+      if (ctx.match || await s.member(uid)) await joinAndOpenMenu(s,uid,ctx.match);
       else { await s.saveSession(uid, { step: 'join' }); await s.screen(uid, `Введи код приглашения.${cancelHint}`); }
     });
     bot.command('cancel', async () => { await s.saveSession(uid); await s.screen(uid, 'Действие отменено.'); await main(s, uid); });
@@ -180,6 +194,20 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
     bot.command('history', async () => history(s, await s.requireMember(uid)));
     bot.command('new', async () => newTask(s, await s.requireMember(uid)));
     bot.command('invite', async ctx => invite(s,await s.requireMember(uid),ctx.me.username));
+    bot.hears(Object.values(navigation),async ctx => {
+      await s.saveSession(uid);
+      const text = ctx.message?.text;
+      if (text === navigation.menu || text === navigation.cancel) {
+        await main(s,uid,text === navigation.cancel ? 'Действие отменено.' : undefined);
+        return;
+      }
+      const viewer = await s.requireMember(uid);
+      if (text === navigation.tasks) await taskList(s,viewer,viewer.id);
+      else if (text === navigation.group) await group(s,viewer);
+      else if (text === navigation.history) await history(s,viewer);
+      else if (text === navigation.create) await newTask(s,viewer);
+      else if (text === navigation.invite) await invite(s,viewer,ctx.me.username);
+    });
     bot.on('callback_query:data', async ctx => {
       const [action, arg, pageArg] = ctx.callbackQuery.data.split(':');
       if (action === 'menu' || action === 'cancel') { await s.saveSession(uid); await main(s, uid); }
@@ -270,7 +298,7 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
       await db.query('ROLLBACK TO SAVEPOINT bot_action');
       const failed = new Service(db, `error:${update.update_id}`, options.now,botId);
       if (update.callback_query) await failed.enqueue('answerCallbackQuery', { callback_query_id: update.callback_query.id, text: error.message.slice(0, 200), show_alert: true });
-      else await failed.screen(uid, error.message);
+      else await failed.screen(uid, error.message,navigationKeyboard(await failed.member(uid)));
     }
   });
 }
