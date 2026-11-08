@@ -13,8 +13,8 @@ const cancelHint = '\n\n«🏠 Меню» отменит текущее дейс
 function navigationKeyboard(member?: Member) {
   const result = new InlineKeyboard();
   if (member) {
-    result.text('📋 Мои задачи','mine').row().text('👥 Группа','group').row().text('📖 Журнал','history').row().text('➕ Создать задачу','new');
-    if (member.role === 'admin') result.row().text('🔗 Приглашение','invite').row().text('⚙️ Настройки','settings');
+    result.text('📋 Мои задачи','mine').row().text('👥 Группа','group').row().text('➕ Создать задачу','new');
+    if (member.role === 'admin') result.row().text('🛠 Админка','admin').row().text('🔗 Приглашение','invite').row().text('⚙️ Настройки','settings');
   } else result.text('🏠 Меню','menu');
   return result;
 }
@@ -47,6 +47,32 @@ async function memberCard(s: Service, viewer: Member, targetId: number) {
   await s.screen(viewer.telegram_id, `${target.name}\n${target.role === 'admin' ? 'Администратор' : 'Участник'}\nНазвания участников настраиваются лично для тебя.`,
     keyboard([[button('📋 Задачи', `list:${targetId}:0`)], [button('✏️ Назвать для себя', `rename:${targetId}`)],
       [button('↩️ Вернуть имя Telegram', `resetname:${targetId}`)], [button('👥 Группа', 'group'),button('🏠 Меню','menu')]]));
+}
+async function adminPanel(s: Service, viewer: Member) {
+  s.admin(viewer);
+  await s.screen(viewer.telegram_id,'🛠 Админка',keyboard([
+    [button('📋 Все задачи','alltasks:0')],[button('📖 Журнал','history')],[button('🏠 Меню','menu')],
+  ]));
+}
+const escapeHtml = (value: string) => value.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+async function allTasks(s: Service, viewer: Member, page = 0) {
+  const tasks = await s.allCreatedTasks(viewer,page);
+  const today = await s.today(viewer);
+  const nav = [];
+  if (page > 0) nav.push(button('⬅️ Назад',`alltasks:${page-1}`));
+  if (tasks.length > 5) nav.push(button('➡️ Дальше',`alltasks:${page+1}`));
+  nav.push(button('🛠 Админка','admin'),button('🏠 Меню','menu'));
+  if (!tasks.length) {
+    await s.screen(viewer.telegram_id,page ? 'На этой странице задач нет.' : 'В группе пока нет созданных задач.',keyboard([nav]));
+    return;
+  }
+  const headers = ['ID','Задача','Исполнитель','Расписание','Срок','Статус','Выполнено','Открыто','Начало'];
+  const rows = tasks.slice(0,5).map(task => {
+    const status = !task.active ? '🗑 Удалена' : task.due_on ? taskStatus({ due_on: task.due_on,completed_at: null },today).text : '🟢 Выполнена';
+    const values = [String(task.id),task.title,task.owner_name,scheduleLabel(task.schedule),task.active ? task.due_on ?? '—' : '—',status,String(task.completed_count),String(task.active ? task.pending_count : 0),task.schedule.start];
+    return `<tr>${values.map(value => `<td>${escapeHtml(value)}</td>`).join('')}</tr>`;
+  });
+  await s.richScreen(viewer.telegram_id,`<h3>📋 Все задачи · страница ${page+1}</h3><table><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr>${rows.join('')}</table>`,keyboard([nav]));
 }
 async function settings(s: Service, viewer: Member, saved = false) {
   const group = await s.reminderSettings(viewer);
@@ -106,7 +132,7 @@ async function history(s: Service, viewer: Member, page = 0) {
   const nav = [];
   if (currentPage > 0) nav.push(button('⬅️ Назад',`history:${currentPage - 1}`));
   if (events.length > (currentPage + 1) * 6) nav.push(button('➡️ Дальше',`history:${currentPage + 1}`));
-  nav.push(button('🏠 Меню','menu'));
+  nav.push(button('🛠 Админка','admin'),button('🏠 Меню','menu'));
   await s.screen(viewer.telegram_id, lines.length ? `📖 События за 7 дней · страница ${currentPage + 1}\n\n${lines.join('\n\n')}` : 'За последние 7 дней событий пока нет.',
     keyboard([nav]));
 }
@@ -252,6 +278,7 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
     bot.command('cancel', async () => { await s.saveSession(uid); await s.screen(uid, 'Действие отменено.'); await main(s, uid); });
     bot.command('group', async () => group(s, await s.requireMember(uid)));
     bot.command(['tasks', 'today'], async () => { const m = await s.requireMember(uid); await taskList(s, m, m.id); });
+    bot.command('admin', async () => adminPanel(s,await s.requireMember(uid)));
     bot.command('history', async () => history(s, await s.requireMember(uid)));
     bot.command('new', async () => newTask(s, await s.requireMember(uid)));
     bot.command('once', async () => newTask(s,await s.requireMember(uid)));
@@ -261,7 +288,7 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
       if (action === 'menu' || action === 'cancel') { await s.saveSession(uid); await main(s, uid); }
       else {
         const viewer = await s.requireMember(uid);
-        if (['group','member','mine','list','task','history','invite','settings','reminderhours'].includes(action ?? '')) await s.saveSession(uid);
+        if (['group','member','mine','list','task','history','invite','settings','reminderhours','admin','alltasks'].includes(action ?? '')) await s.saveSession(uid);
         if (action === 'group') await group(s, viewer);
         else if (action === 'member') await memberCard(s, viewer, id(arg));
         else if (action === 'rename') {
@@ -272,6 +299,8 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
         else if (action === 'mine') await taskList(s, viewer, viewer.id);
         else if (action === 'list') await taskList(s, viewer, id(arg), /^\d{1,5}$/.test(pageArg ?? '') ? Number(pageArg) : 0);
         else if (action === 'task') await taskCard(s, viewer, id(arg));
+        else if (action === 'admin') await adminPanel(s,viewer);
+        else if (action === 'alltasks') await allTasks(s,viewer,/^\d{1,5}$/.test(arg ?? '') ? Math.min(10000,Number(arg)) : 0);
         else if (action === 'history') await history(s, viewer,/^\d$/.test(arg ?? '') ? Number(arg) : 0);
         else if (action === 'new') await newTask(s, viewer);
         else if (action === 'newonce') await newTask(s,viewer);

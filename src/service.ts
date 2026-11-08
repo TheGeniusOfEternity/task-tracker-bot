@@ -30,6 +30,11 @@ export class Service {
       ...(this.previousMessageId ? { __previous_message_id: this.previousMessageId } : {}),
       reply_markup: keyboard ?? { inline_keyboard: [[{ text: '🏠 Меню',callback_data: 'menu' }]] } });
   }
+  async richScreen(chatId: string, html: string, markup: unknown) {
+    await this.enqueue('sendRichMessage',{ chat_id: chatId,rich_message: { html },reply_markup: markup,__screen: true,
+      ...(this.previousMessageId ? { __previous_message_id: this.previousMessageId } : {}),
+    });
+  }
   async member(telegramId: string): Promise<Member | undefined> {
     return (await this.db.query<Member>(`SELECT m.*, u.profile_name AS name FROM members m JOIN app_users u USING (bot_id,telegram_id) WHERE m.telegram_id=$1 AND m.bot_id=$2`, [telegramId,this.botId])).rows[0];
   }
@@ -261,8 +266,23 @@ export class Service {
     await this.closeHelp(id);
     await this.event(id, viewer.id, 'help_cancelled');
   }
+  async allCreatedTasks(admin: Member, page = 0) {
+    this.admin(admin);
+    await this.materialize(admin.group_id);
+    return (await this.db.query<{ id: number; title: string; owner_name: string; schedule: Schedule; active: boolean; due_on: string | null; completed_count: number; pending_count: number }>(`
+      SELECT t.id,t.title,coalesce(a.name,u.profile_name) AS owner_name,t.schedule,t.active,
+        coalesce(stats.due_on,CASE WHEN t.active THEN t.next_on END)::text AS due_on,
+        stats.completed_count,stats.pending_count
+      FROM tasks t JOIN task_groups g ON g.id=t.group_id
+      JOIN members m ON m.id=t.owner_id JOIN app_users u ON u.bot_id=m.bot_id AND u.telegram_id=m.telegram_id
+      LEFT JOIN aliases a ON a.target_id=m.id AND a.viewer_id=$1
+      CROSS JOIN LATERAL (SELECT min(o.due_on) FILTER (WHERE o.completed_at IS NULL) AS due_on,
+        count(*) FILTER (WHERE o.completed_at IS NOT NULL)::int AS completed_count,
+        count(*) FILTER (WHERE o.completed_at IS NULL)::int AS pending_count FROM occurrences o WHERE o.task_id=t.id) stats
+      WHERE t.group_id=$2 AND g.bot_id=$3 ORDER BY t.id DESC LIMIT 6 OFFSET $4`,[admin.id,admin.group_id,this.botId,Math.max(0,Math.min(10000,page))*5])).rows;
+  }
   async history(viewer: Member) {
-    this.assertMember(viewer);
+    this.admin(viewer);
     return (await this.db.query<{ title: string; kind: string; actor_id: number; created_at: Date; due_on: string }>(`SELECT t.title,e.kind,e.actor_id,e.created_at,o.due_on::text FROM events e
       JOIN occurrences o ON o.id=e.occurrence_id JOIN tasks t ON t.id=o.task_id
       WHERE o.group_id=$1 AND e.created_at >= $2 AND o.group_id IN (SELECT id FROM task_groups WHERE bot_id=$3) ORDER BY e.id DESC LIMIT 20`, [viewer.group_id, new Date(this.now.getTime() - 7 * 86400_000),this.botId])).rows;

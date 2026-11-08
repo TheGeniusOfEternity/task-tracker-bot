@@ -11,7 +11,7 @@ export class TelegramError extends Error {
 export type Transport = (method: string, payload: Record<string, unknown>) => Promise<{ message_id?: number }>;
 export function telegramTransport(token: string, timeoutMs = 8000): Transport {
   return async (method, payload) => {
-    if (!['sendMessage', 'editMessageText', 'editMessageReplyMarkup', 'answerCallbackQuery', 'deleteMessage'].includes(method)) throw new Error('Unsupported outbox method');
+    if (!['sendMessage', 'sendRichMessage', 'editMessageText', 'editMessageReplyMarkup', 'answerCallbackQuery', 'deleteMessage'].includes(method)) throw new Error('Unsupported outbox method');
     const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(timeoutMs),
     });
@@ -70,7 +70,7 @@ export async function flushOutbox(store: Store, transport: Transport, botId = 'd
           // Serialize screen changes per bot and viewer, even when delivery workers finish out of order.
           await db.query('SELECT telegram_id FROM app_users WHERE bot_id=$1 AND telegram_id=$2 FOR UPDATE',[botId,job.payload.chat_id]);
           const previous = (await db.query<{ id: number; payload: Record<string,unknown> }>(`SELECT id,payload FROM outbox
-            WHERE bot_id=$1 AND id<>$2 AND state='sent' AND method='sendMessage'
+            WHERE bot_id=$1 AND id<>$2 AND state='sent' AND method IN ('sendMessage','sendRichMessage')
               AND payload->>'chat_id'=$3 AND payload->>'__screen'='true'
               AND payload ? '__message_id' AND coalesce(payload->>'__retired','false')<>'true'
             ORDER BY id DESC LIMIT 1`,[botId,job.id,String(job.payload.chat_id)])).rows[0];

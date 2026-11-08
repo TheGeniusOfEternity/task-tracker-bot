@@ -18,7 +18,7 @@ try {
       { command: 'start', description: 'Главное меню' },
       { command: 'tasks', description: 'Мои задачи' },
       { command: 'group', description: 'Группа и личные имена' },
-      { command: 'history', description: 'Журнал за неделю' },
+      { command: 'admin', description: 'Админка' },
       { command: 'new', description: 'Создать задачу' },
       { command: 'join', description: 'Вступить по коду' },
       { command: 'cancel', description: 'Отменить текущее действие' },

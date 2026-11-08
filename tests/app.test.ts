@@ -146,7 +146,7 @@ test('opening an invite as an existing member shows an inline menu without chang
   assert.match(reply.text,/Ты уже состоишь в группе/);
   assert.equal(reply.reply_markup.keyboard,undefined);
   const labels = reply.reply_markup.inline_keyboard.flat().map((button: { text: string }) => button.text);
-  for (const label of ['📋 Мои задачи','👥 Группа','📖 Журнал','➕ Создать задачу','🔗 Приглашение']) assert.ok(labels.includes(label));
+  for (const label of ['📋 Мои задачи','👥 Группа','🛠 Админка','➕ Создать задачу','🔗 Приглашение']) assert.ok(labels.includes(label));
   assert.equal((await run(s => s.requireMember('101'))).group_id,a.group_id);
   assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'error:950:%'")).rows.length,0);
 });
@@ -912,6 +912,84 @@ test('self creation cannot assign to another member, group or bot through forged
   await run(s => s.createTask(b,'Своя задача',b.id,{ kind: 'once',start: '2026-11-09' }));
   await run(s => s.createTask(a,'Назначенная задача',c.id,{ kind: 'once',start: '2026-11-09' }));
   assert.deepEqual((await store.query('SELECT owner_id FROM tasks ORDER BY id')).rows.map(r => r.owner_id),[b.id,c.id]);
+});
+
+test('admin panel contains history and all tasks while ordinary members cannot access it', async () => {
+  await update(message(2200,'/start'));
+  const main = (await store.query("SELECT payload FROM outbox WHERE dedupe_key LIKE 'update:2200:%' AND method='sendMessage' ORDER BY id DESC LIMIT 1")).rows[0]!.payload;
+  const actions = (payload: { reply_markup: { inline_keyboard: { callback_data: string }[][] } }) => payload.reply_markup.inline_keyboard.flat().map(b => b.callback_data);
+  assert.ok(actions(main).includes('admin')); assert.equal(actions(main).includes('history'),false);
+  await update(callback(2201,'admin'));
+  const panel = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:2201:0'")).rows[0]!.payload;
+  assert.deepEqual(actions(panel),['alltasks:0','history','menu']);
+  for (const [index,data] of ['admin','alltasks:0','history'].entries()) {
+    await update(callback(2202+index,data,102));
+    assert.equal((await store.query('SELECT payload FROM outbox WHERE dedupe_key=$1',[`error:${2202+index}:0`])).rows[0]!.payload.show_alert,true);
+  }
+  await assert.rejects(run(s => s.history(b)),UserError);
+  await assert.rejects(run(s => s.allCreatedTasks(b)),UserError);
+  await update(message(2205,'/history',102));
+  assert.match((await store.query("SELECT payload FROM outbox WHERE dedupe_key='error:2205:0'")).rows[0]!.payload.text,/администратору/);
+});
+
+test('all tasks includes each template once with completion counts, deleted tasks and personal names', async () => {
+  await run(s => s.alias(a,b.id,'Коллега <&>'));
+  const once = await run(s => s.createTask(b,'Задача <&> с полным названием',b.id,{ kind: 'once',start: '2026-11-08' }));
+  const occurrenceId = (await store.query('SELECT id FROM occurrences WHERE task_id=$1',[once])).rows[0]!.id;
+  await run(s => s.complete(b,occurrenceId));
+  const daily = await run(s => s.createTask(a,'Ежедневная',a.id,{ kind: 'daily',start: '2026-11-08' }));
+  const deleted = await run(s => s.createTask(a,'Удалённая',b.id,{ kind: 'once',start: '2026-11-08' }));
+  const deletedOccurrence = Number((await store.query('SELECT id FROM occurrences WHERE task_id=$1',[deleted])).rows[0]!.id);
+  await run(s => s.deleteTask(a,deletedOccurrence));
+  await run(s => s.createTask(outsider,'Чужая группа',outsider.id,{ kind: 'once',start: '2026-11-08' }));
+  const work = await otherBot();
+  await runFor('work',s => s.createTask(work.admin,'Чужой бот',work.admin.id,{ kind: 'once',start: '2026-11-08' }));
+  const tasks = await run(s => s.allCreatedTasks(a));
+  assert.equal(tasks.length,3); assert.equal(tasks.filter(t => t.id === daily).length,1);
+  assert.equal(tasks.find(t => t.id === daily)!.pending_count,8);
+  assert.equal(tasks.find(t => t.id === once)!.completed_count,1);
+  assert.equal(tasks.find(t => t.id === once)!.owner_name,'Коллега <&>');
+  await assert.rejects(runFor('work',s => s.allCreatedTasks(a)),UserError);
+  assert.equal((await runFor('work',s => s.allCreatedTasks(work.admin))).length,1);
+  await update(callback(2220,'alltasks:0'));
+  const job = (await store.query("SELECT method,payload FROM outbox WHERE dedupe_key='update:2220:0'")).rows[0]!;
+  assert.equal(job.method,'sendRichMessage');
+  const html = job.payload.rich_message.html;
+  assert.match(html,/<table><tr><th>ID/); assert.equal((html.match(/<tr>/g) ?? []).length,4);
+  assert.match(html,/Задача &lt;&amp;&gt; с полным названием/);
+  assert.match(html,/Коллега &lt;&amp;&gt;/); assert.match(html,/Удалена/); assert.match(html,/Выполнена/);
+  assert.doesNotMatch(html,/Чужая группа|Чужой бот/);
+});
+
+test('all tasks table paginates and handles an empty group', async () => {
+  await update(callback(2230,'alltasks:0'));
+  assert.match((await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:2230:0'")).rows[0]!.payload.text,/пока нет/);
+  for (let index = 0; index < 7; index++) await run(s => s.createTask(a,`Проверка ${index}`,a.id,{ kind: 'once',start: '2026-11-08' }));
+  await update(callback(2231,'alltasks:0'));
+  const first = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:2231:0'")).rows[0]!.payload;
+  assert.equal((first.rich_message.html.match(/<tr>/g) ?? []).length,6);
+  assert.equal(first.reply_markup.inline_keyboard[0][0].callback_data,'alltasks:1');
+  await update(callback(2232,'alltasks:1'));
+  const last = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:2232:0'")).rows[0]!.payload;
+  assert.equal((last.rich_message.html.match(/<tr>/g) ?? []).length,3);
+  assert.equal(last.reply_markup.inline_keyboard[0][0].callback_data,'alltasks:0');
+  assert.equal(last.reply_markup.inline_keyboard.flat().some((b: { callback_data: string }) => b.callback_data === 'alltasks:2'),false);
+});
+
+test('rich table screens replace ordinary screens and are retired when returning to a menu', async () => {
+  let messageId = 3000;
+  const deleted: number[] = [];
+  const transport = async (method: string,payload: Record<string,unknown>) => {
+    assert.equal(Object.keys(payload).some(key => key.startsWith('__')),false);
+    if (method === 'deleteMessage') deleted.push(Number(payload.message_id));
+    return method === 'sendMessage' || method === 'sendRichMessage' ? { message_id: messageId++ } : {};
+  };
+  await run(s => s.screen('101','Меню')); await flushOutbox(store,transport);
+  await run(s => s.richScreen('101','<table><tr><td>Таблица</td></tr></table>',{ inline_keyboard: [] })); await flushOutbox(store,transport);
+  await run(s => s.screen('101','Админка')); await flushOutbox(store,transport);
+  assert.deepEqual(deleted,[3000,3001]);
+  const latest = (await store.query("SELECT method,payload FROM outbox WHERE payload->>'__screen'='true' AND payload->>'__retired'='false'")).rows;
+  assert.equal(latest.length,1); assert.equal(latest[0]!.method,'sendMessage');
 });
 
 test('a draft confirmed on a later day refreshes its automatic deadline before creation', async () => {
