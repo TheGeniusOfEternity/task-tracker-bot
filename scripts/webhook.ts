@@ -20,6 +20,7 @@ try {
       { command: 'group', description: 'Группа и личные имена' },
       { command: 'history', description: 'Журнал за неделю' },
       { command: 'new', description: 'Создать задачу (админ)' },
+      { command: 'once', description: 'Разовая задача (админ)' },
       { command: 'join', description: 'Вступить по коду' },
       { command: 'cancel', description: 'Отменить текущее действие' },
     ]);

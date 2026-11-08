@@ -9,7 +9,7 @@ import { Service, type Member } from '../src/service.js';
 import { processUpdate } from '../src/bot.js';
 import { flushOutbox, TelegramError } from '../src/outbox.js';
 import { matchesSecret, UserError } from '../src/security.js';
-import { addDays, firstDue, localDay, nextDue, shouldRemind, validDay, type Schedule } from '../src/schedule.js';
+import { addDays, firstDue, localDay, nextDue, scheduleLabel, shouldRemind, validDay, weekdaysLabel, type Schedule } from '../src/schedule.js';
 import webhook from '../api/webhook.js';
 import cron from '../api/cron.js';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -552,17 +552,92 @@ test('monthly weekday and weekend recovery can be configured through buttons', a
   await update(message(100,'/new'));
   await update(message(101,'Месячная проверка'));
   await update(callback(102,`owner:${b.id}`));
-  await update(callback(103,'kind:monthly_weekday'));
+  await update(callback(103,'taskday:6'));
+  await update(callback(109,'taskdaysdone'));
+  await update(callback(110,'period:monthly'));
   await update(callback(104,'ordinal:1'));
-  await update(callback(105,'monthweekday:6'));
   await update(message(106,'2026-11-08'));
   await update(callback(107,'overdue:weekends'));
   await update(callback(108,'createtask'));
   const task = (await store.query('SELECT schedule FROM tasks')).rows[0]!;
-  assert.deepEqual(task.schedule,{ kind: 'monthly_weekday',start: '2026-11-08',ordinal: 1,weekday: 6,overdue: 'weekends' });
+  assert.deepEqual(task.schedule,{ kind: 'monthly_weekday',start: '2026-11-08',ordinal: 1,weekdays: [6],overdue: 'weekends' });
   assert.equal((await store.query('SELECT due_on::text FROM occurrences')).rows[0]!.due_on,'2026-12-05');
   await runAt('2027-01-02',s => s.materialize(a.group_id));
   assert.equal((await store.query('SELECT id FROM occurrences WHERE completed_at IS NULL')).rows.length,1);
+});
+
+test('weekday checkbox selection toggles in place and rejects an empty selection', async () => {
+  await update(message(1200,'/new')); await update(message(1201,'Проверка'));
+  await update(callback(1202,`owner:${a.id}`));
+  assert.equal((await run(s => s.session('101')))?.step,'task_days');
+  await update(callback(1203,'taskdaysdone'));
+  assert.equal((await run(s => s.session('101')))?.step,'task_days');
+  assert.equal((await store.query("SELECT payload FROM outbox WHERE dedupe_key='error:1203:0'")).rows[0]!.payload.show_alert,true);
+  await update(callback(1204,'taskday:1'));
+  await update(callback(1204,'taskday:1')); // Telegram retry must not toggle twice.
+  assert.deepEqual((await run(s => s.session('101')))?.weekdays,[1]);
+  const first = (await store.query("SELECT method,payload FROM outbox WHERE dedupe_key='update:1204:0'")).rows[0]!;
+  assert.equal(first.method,'editMessageText');
+  assert.match(first.payload.reply_markup.inline_keyboard[0][0].text,/✅/);
+  assert.equal((await store.query("SELECT id FROM outbox WHERE dedupe_key LIKE 'update:1204:%' AND method='sendMessage'")).rows.length,0);
+  await update(callback(1205,'taskday:1'));
+  assert.deepEqual((await run(s => s.session('101')))?.weekdays,[]);
+  await update(callback(1206,'taskdaysall'));
+  const all = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1206:0'")).rows[0]!.payload;
+  assert.match(all.text,/Выбрано: Каждый день/);
+  await update(callback(1207,'taskdaysdone'));
+  const periods = (await store.query("SELECT payload FROM outbox WHERE dedupe_key='update:1207:0'")).rows[0]!.payload;
+  assert.deepEqual(periods.reply_markup.inline_keyboard.slice(0,2).map((row: { callback_data: string }[]) => row[0]!.callback_data),['period:weekly','period:monthly']);
+  await update(callback(1208,'backdays'));
+  assert.deepEqual((await run(s => s.session('101')))?.weekdays,[1,2,3,4,5,6,7]);
+  await update(callback(1209,'taskdaysdone')); await update(callback(1210,'period:weekly'));
+  await update(message(1211,'2026-11-08')); await update(callback(1212,'overdue:daily')); await update(callback(1213,'createtask'));
+  const schedule = (await store.query('SELECT schedule FROM tasks')).rows[0]!.schedule;
+  assert.equal(schedule.kind,'daily'); assert.equal(scheduleLabel(schedule),'Каждый день');
+});
+
+test('monthly recurrence supports multiple checked weekdays within the same month', () => {
+  const monthly: Schedule = { kind: 'monthly_weekday',start: '2026-11-01',weekdays: [1,3,6],ordinal: 1 };
+  assert.equal(firstDue(monthly),'2026-11-02');
+  assert.equal(nextDue(monthly,'2026-11-02'),'2026-11-04');
+  assert.equal(nextDue(monthly,'2026-11-04'),'2026-11-07');
+  assert.equal(nextDue(monthly,'2026-11-07'),'2026-12-02');
+  assert.equal(firstDue({ ...monthly,start: '2026-11-03' }),'2026-11-04');
+  assert.match(scheduleLabel(monthly),/первые: понедельник, среда, суббота/);
+  const all: Schedule = { ...monthly,weekdays: [1,2,3,4,5,6,7] };
+  assert.equal(firstDue(all),'2026-11-01');
+  assert.equal(nextDue(all,'2026-11-07'),'2026-12-01');
+  assert.match(scheduleLabel(all),/каждый день, 1–7/);
+  assert.equal(firstDue({ ...all,start: '2028-02-01',ordinal: -1 }),'2028-02-23');
+  assert.equal(weekdaysLabel([7,3]),'среда, воскресенье');
+});
+
+test('one-off task creation remains available without weekday and period selection', async () => {
+  await update(callback(1220,'newonce')); await update(message(1221,'Разовая проверка'));
+  await update(callback(1222,`owner:${b.id}`));
+  assert.equal((await run(s => s.session('101')))?.step,'task_date');
+  await update(message(1223,'2026-11-08')); await update(callback(1224,'overdue:daily')); await update(callback(1225,'createtask'));
+  assert.equal((await store.query('SELECT schedule FROM tasks')).rows[0]!.schedule.kind,'once');
+  assert.equal((await store.query('SELECT id FROM occurrences')).rows.length,1);
+});
+
+test('concurrent checkbox edits finish with the latest state and not-modified responses are harmless', async () => {
+  await run(async s => {
+    await s.enqueue('editMessageText',{ chat_id: '101',message_id: 77,text: 'Первое состояние' });
+    await s.enqueue('editMessageText',{ chat_id: '101',message_id: 77,text: 'Последнее состояние' });
+  });
+  let release!: () => void,started!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const active = new Promise<void>(resolve => { started = resolve; });
+  const texts: unknown[] = [];
+  const older = flushOutbox(store,async (_method,payload) => { texts.push(payload.text); started(); await gate; return {}; },'default',1);
+  await active;
+  await flushOutbox(store,async (_method,payload) => { texts.push(payload.text); return {}; },'default',1);
+  assert.deepEqual(texts,['Первое состояние']);
+  release(); await older;
+  await flushOutbox(store,async (_method,payload) => { texts.push(String(payload.text)); throw new TelegramError(400,undefined,true); });
+  assert.deepEqual(texts,['Первое состояние','Последнее состояние']);
+  assert.equal((await store.query("SELECT id FROM outbox WHERE state<>'sent'")).rows.length,0);
 });
 
 test('group migration preserves existing memberships, assignments and private aliases', async () => {
@@ -689,9 +764,12 @@ test('interactive task creation survives updates and uses fixed assignment', asy
   await update(message(20,'/new'));
   await update(message(21,'Обновить документацию'));
   await update(callback(22,`owner:${b.id}`));
-  await update(callback(23,'kind:weekly'));
+  await update(callback(23,'taskday:1'));
+  await update(callback(231,'taskday:3'));
+  await update(callback(232,'taskday:5'));
+  await update(callback(233,'taskdaysdone'));
+  await update(callback(234,'period:weekly'));
   await update(message(24,'2026-11-08'));
-  await update(message(25,'1,3,5'));
   await update(callback(250,'overdue:daily'));
   await update(callback(26,'createtask'));
   await update(callback(26,'createtask'));

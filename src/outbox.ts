@@ -6,17 +6,17 @@ export interface Delivery {
   guard_help_id: number | null; recipient_id: number | null;
 }
 export class TelegramError extends Error {
-  constructor(readonly code: number, readonly retryAfter?: number) { super(`Telegram error ${code}`); }
+  constructor(readonly code: number, readonly retryAfter?: number, readonly notModified = false) { super(`Telegram error ${code}`); }
 }
 export type Transport = (method: string, payload: Record<string, unknown>) => Promise<{ message_id?: number }>;
 export function telegramTransport(token: string, timeoutMs = 8000): Transport {
   return async (method, payload) => {
-    if (!['sendMessage', 'editMessageReplyMarkup', 'answerCallbackQuery', 'deleteMessage'].includes(method)) throw new Error('Unsupported outbox method');
+    if (!['sendMessage', 'editMessageText', 'editMessageReplyMarkup', 'answerCallbackQuery', 'deleteMessage'].includes(method)) throw new Error('Unsupported outbox method');
     const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(timeoutMs),
     });
-    const body = await response.json() as { ok: boolean; result: { message_id?: number }; error_code?: number; parameters?: { retry_after?: number } };
-    if (!body.ok) throw new TelegramError(body.error_code ?? response.status, body.parameters?.retry_after);
+    const body = await response.json() as { ok: boolean; result: { message_id?: number }; error_code?: number; description?: string; parameters?: { retry_after?: number } };
+    if (!body.ok) throw new TelegramError(body.error_code ?? response.status, body.parameters?.retry_after,body.description?.includes('message is not modified'));
     return typeof body.result === 'object' ? body.result : {};
   };
 }
@@ -29,6 +29,15 @@ export async function flushOutbox(store: Store, transport: Transport, botId = 'd
         WHERE bot_id=$1 AND ((state='pending' AND available_at<=now()) OR (state='sending' AND lease_until<now()))
         ORDER BY (method='answerCallbackQuery') DESC,id FOR UPDATE SKIP LOCKED LIMIT 1`,[botId])).rows[0];
       if (!selected) return;
+      if (selected.method === 'editMessageText') {
+        await db.query('SELECT telegram_id FROM app_users WHERE bot_id=$1 AND telegram_id=$2 FOR UPDATE',[botId,selected.payload.chat_id]);
+        const newer = await db.query(`SELECT id FROM outbox WHERE bot_id=$1 AND id>$2 AND state='sent' AND method='editMessageText'
+          AND payload->>'chat_id'=$3 AND payload->>'message_id'=$4 LIMIT 1`,[botId,selected.id,String(selected.payload.chat_id),String(selected.payload.message_id)]);
+        if (newer.rows.length) { await db.query("UPDATE outbox SET state='sent' WHERE id=$1",[selected.id]); return { skip: true } as const; }
+        const busy = await db.query(`SELECT id FROM outbox WHERE bot_id=$1 AND id<>$2 AND state='sending' AND lease_until>=now() AND method='editMessageText'
+          AND payload->>'chat_id'=$3 AND payload->>'message_id'=$4 LIMIT 1`,[botId,selected.id,String(selected.payload.chat_id),String(selected.payload.message_id)]);
+        if (busy.rows.length) return;
+      }
       if (selected.guard_help_id) {
         const state = (await db.query<{ state: string }>('SELECT state FROM help_requests WHERE id=$1', [selected.guard_help_id])).rows[0]?.state;
         if (state !== 'pending') { await db.query("UPDATE outbox SET state='sent' WHERE id=$1", [selected.id]); return { skip: true } as const; }
@@ -77,6 +86,10 @@ export async function flushOutbox(store: Store, transport: Transport, botId = 'd
       });
       sent++;
     } catch (error) {
+      if (job.method === 'editMessageText' && error instanceof TelegramError && error.code === 400 && error.notModified) {
+        await store.query("UPDATE outbox SET state='sent',lease_until=NULL WHERE id=$1",[job.id]);
+        sent++; continue;
+      }
       const permanent = error instanceof TelegramError && [400, 401, 403, 404].includes(error.code);
       const exhausted = job.attempts + 1 >= 8;
       const delay = error instanceof TelegramError && error.retryAfter ? error.retryAfter : Math.min(3600, 2 ** (job.attempts + 1) * 5);
