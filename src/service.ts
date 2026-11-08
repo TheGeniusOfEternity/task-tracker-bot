@@ -3,7 +3,7 @@ import type { Database } from './db.js';
 import { addDays, firstDue, localDay, nextDue, shouldRemind, type Schedule } from './schedule.js';
 import { hashCode, UserError } from './security.js';
 
-export interface Member { id: number; group_id: number; telegram_id: string; role: 'admin' | 'member'; name: string }
+export interface Member { id: number; group_id: number; bot_id: string; telegram_id: string; role: 'admin' | 'member'; name: string }
 export interface Occurrence {
   id: number; task_id: number; group_id: number; title: string; due_on: string;
   original_owner_id: number; assignee_id: number; completed_by: number | null; completed_at: Date | null; schedule: Schedule;
@@ -12,17 +12,20 @@ export type Session = { step: string; [key: string]: unknown };
 const dateColumns = `o.id, o.task_id, o.group_id, t.title, o.due_on::text, o.original_owner_id, o.assignee_id, o.completed_by, o.completed_at, t.schedule`;
 export class Service {
   private sequence = 0;
-  constructor(readonly db: Database, readonly key: string, readonly now = new Date()) {}
+  constructor(readonly db: Database, readonly key: string, readonly now = new Date(), readonly botId = 'default') {}
+  private assertMember(member: Member) {
+    if (member.bot_id !== this.botId) throw new UserError('Этот участник относится к другому боту.');
+  }
   async enqueue(method: string, payload: Record<string, unknown>, key?: string, helpId?: number, recipientId?: number) {
-    await this.db.query(`INSERT INTO outbox (dedupe_key, method, payload, guard_help_id, recipient_id)
-      VALUES ($1,$2,$3,$4,$5) ON CONFLICT (dedupe_key) DO NOTHING`,
-      [key ?? `${this.key}:${this.sequence++}`, method, JSON.stringify(payload), helpId ?? null, recipientId ?? null]);
+    await this.db.query(`INSERT INTO outbox (dedupe_key, method, payload, guard_help_id, recipient_id,bot_id)
+      VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (bot_id,dedupe_key) DO NOTHING`,
+      [key ?? `${this.key}:${this.sequence++}`, method, JSON.stringify(payload), helpId ?? null, recipientId ?? null,this.botId]);
   }
   async send(chatId: string | number, text: string, keyboard?: unknown, key?: string) {
     await this.enqueue('sendMessage', { chat_id: chatId, text, ...(keyboard ? { reply_markup: keyboard } : {}) }, key);
   }
   async member(telegramId: string): Promise<Member | undefined> {
-    return (await this.db.query<Member>(`SELECT m.*, u.profile_name AS name FROM members m JOIN app_users u USING (telegram_id) WHERE m.telegram_id=$1`, [telegramId])).rows[0];
+    return (await this.db.query<Member>(`SELECT m.*, u.profile_name AS name FROM members m JOIN app_users u USING (bot_id,telegram_id) WHERE m.telegram_id=$1 AND m.bot_id=$2`, [telegramId,this.botId])).rows[0];
   }
   async requireMember(telegramId: string) {
     const member = await this.member(telegramId);
@@ -30,9 +33,10 @@ export class Service {
     return member;
   }
   async members(viewer: Member): Promise<Member[]> {
+    this.assertMember(viewer);
     return (await this.db.query<Member>(`SELECT m.*, coalesce(a.name,u.profile_name) AS name FROM members m
-      JOIN app_users u USING (telegram_id) LEFT JOIN aliases a ON a.target_id=m.id AND a.viewer_id=$1
-      WHERE m.group_id=$2 ORDER BY m.id`, [viewer.id, viewer.group_id])).rows;
+      JOIN app_users u USING (bot_id,telegram_id) LEFT JOIN aliases a ON a.target_id=m.id AND a.viewer_id=$1
+      WHERE m.group_id=$2 AND m.bot_id=$3 ORDER BY m.id`, [viewer.id, viewer.group_id,this.botId])).rows;
   }
   async target(viewer: Member, id: number) {
     const member = (await this.members(viewer)).find(m => m.id === id);
@@ -54,8 +58,8 @@ export class Service {
     if (!allowedIds.includes(telegramId)) throw new UserError('Создание группы доступно администратору бота. Для вступления используй код приглашения.');
     if (await this.member(telegramId)) throw new UserError('Ты уже состоишь в группе.');
     if (!name.trim() || name.trim().length > 80) throw new UserError('Название группы: от 1 до 80 символов.');
-    const group = (await this.db.query<{ id: number }>('INSERT INTO task_groups (name) VALUES ($1) RETURNING id', [name.trim()])).rows[0]!;
-    await this.db.query(`INSERT INTO members (group_id,telegram_id,role) VALUES ($1,$2,'admin')`, [group.id, telegramId]);
+    const group = (await this.db.query<{ id: number }>('INSERT INTO task_groups (name,bot_id) VALUES ($1,$2) RETURNING id', [name.trim(),this.botId])).rows[0]!;
+    await this.db.query(`INSERT INTO members (group_id,telegram_id,role,bot_id) VALUES ($1,$2,'admin',$3)`, [group.id, telegramId,this.botId]);
     return this.requireMember(telegramId);
   }
   async invite(admin: Member) {
@@ -67,22 +71,24 @@ export class Service {
   }
   async join(telegramId: string, code: string) {
     if (await this.member(telegramId)) throw new UserError('Ты уже состоишь в группе.');
-    const group = (await this.db.query<{ id: number }>('SELECT id FROM task_groups WHERE invite_hash=$1 AND invite_expires_at>$2', [hashCode(code), this.now])).rows[0];
+    const group = (await this.db.query<{ id: number }>('SELECT id FROM task_groups WHERE invite_hash=$1 AND invite_expires_at>$2 AND bot_id=$3', [hashCode(code), this.now,this.botId])).rows[0];
     if (!group) throw new UserError('Код не найден или истёк. Попроси администратора прислать новый.');
-    await this.db.query(`INSERT INTO members (group_id,telegram_id,role) VALUES ($1,$2,'member')`, [group.id, telegramId]);
+    await this.db.query(`INSERT INTO members (group_id,telegram_id,role,bot_id) VALUES ($1,$2,'member',$3)`, [group.id, telegramId,this.botId]);
   }
-  admin(member: Member) { if (member.role !== 'admin') throw new UserError('Это действие доступно администратору группы.'); }
+  admin(member: Member) { this.assertMember(member); if (member.role !== 'admin') throw new UserError('Это действие доступно администратору группы.'); }
   async session(telegramId: string): Promise<Session | undefined> {
-    return (await this.db.query<{ data: Session }>('SELECT data FROM sessions WHERE telegram_id=$1 AND expires_at>$2', [telegramId, this.now])).rows[0]?.data;
+    return (await this.db.query<{ data: Session }>('SELECT data FROM sessions WHERE telegram_id=$1 AND expires_at>$2 AND bot_id=$3', [telegramId, this.now,this.botId])).rows[0]?.data;
   }
   async saveSession(telegramId: string, data?: Session) {
-    if (!data) { await this.db.query('DELETE FROM sessions WHERE telegram_id=$1', [telegramId]); return; }
-    await this.db.query(`INSERT INTO sessions (telegram_id,data,expires_at) VALUES ($1,$2,$3)
-      ON CONFLICT (telegram_id) DO UPDATE SET data=excluded.data,expires_at=excluded.expires_at`,
-      [telegramId, JSON.stringify(data), new Date(this.now.getTime() + 3600_000)]);
+    if (!data) { await this.db.query('DELETE FROM sessions WHERE telegram_id=$1 AND bot_id=$2', [telegramId,this.botId]); return; }
+    await this.db.query(`INSERT INTO sessions (telegram_id,data,expires_at,bot_id) VALUES ($1,$2,$3,$4)
+      ON CONFLICT (bot_id,telegram_id) DO UPDATE SET data=excluded.data,expires_at=excluded.expires_at`,
+      [telegramId, JSON.stringify(data), new Date(this.now.getTime() + 3600_000),this.botId]);
   }
   async today(member: Member) {
-    const group = (await this.db.query<{ timezone: string }>('SELECT timezone FROM task_groups WHERE id=$1', [member.group_id])).rows[0]!;
+    this.assertMember(member);
+    const group = (await this.db.query<{ timezone: string }>('SELECT timezone FROM task_groups WHERE id=$1 AND bot_id=$2', [member.group_id,this.botId])).rows[0];
+    if (!group) throw new UserError('Группа не найдена у этого бота.');
     return localDay(this.now, group.timezone);
   }
   async createTask(admin: Member, title: string, ownerId: number, schedule: Schedule) {
@@ -101,7 +107,8 @@ export class Service {
     return task.id;
   }
   async materialize(groupId: number) {
-    const group = (await this.db.query<{ timezone: string }>('SELECT timezone FROM task_groups WHERE id=$1', [groupId])).rows[0]!;
+    const group = (await this.db.query<{ timezone: string }>('SELECT timezone FROM task_groups WHERE id=$1 AND bot_id=$2', [groupId,this.botId])).rows[0];
+    if (!group) throw new UserError('Группа не найдена у этого бота.');
     const today = localDay(this.now, group.timezone);
     const through = addDays(today, 7);
     const tasks = (await this.db.query<{ id: number; owner_id: number; schedule: Schedule; next_on: string }>(
@@ -138,13 +145,14 @@ export class Service {
       ORDER BY o.due_on,o.id LIMIT 6 OFFSET $3`, [viewer.group_id, ownerId, Math.max(0, Math.min(10000, page)) * 5])).rows;
   }
   async occurrence(viewer: Member, id: number, lock = false): Promise<Occurrence> {
+    this.assertMember(viewer);
     if (lock) {
       // Match materialize's lock order: template first, occurrence second.
       await this.db.query(`SELECT t.id FROM tasks t JOIN occurrences o ON o.task_id=t.id
-        WHERE o.id=$1 AND o.group_id=$2 FOR UPDATE OF t`, [id, viewer.group_id]);
+        WHERE o.id=$1 AND o.group_id=$2 AND o.group_id IN (SELECT id FROM task_groups WHERE bot_id=$3) FOR UPDATE OF t`, [id, viewer.group_id,this.botId]);
     }
     const occurrence = (await this.db.query<Occurrence>(`SELECT ${dateColumns} FROM occurrences o JOIN tasks t ON t.id=o.task_id
-      WHERE o.id=$1 AND o.group_id=$2 ${lock ? 'FOR UPDATE OF o' : ''}`, [id, viewer.group_id])).rows[0];
+      WHERE o.id=$1 AND o.group_id=$2 AND o.group_id IN (SELECT id FROM task_groups WHERE bot_id=$3) ${lock ? 'FOR UPDATE OF o' : ''}`, [id, viewer.group_id,this.botId])).rows[0];
     if (!occurrence) throw new UserError('Задача не найдена в твоей группе.');
     return occurrence;
   }
@@ -201,11 +209,12 @@ export class Service {
     return request.id;
   }
   async acceptHelp(viewer: Member, requestId: number) {
+    this.assertMember(viewer);
     const request = (await this.db.query<{ occurrence_id: number; requester_id: number }>(`SELECT h.occurrence_id,h.requester_id FROM help_requests h
       JOIN help_recipients r ON r.request_id=h.id JOIN occurrences o ON o.id=h.occurrence_id
       WHERE h.id=$1 AND r.member_id=$2 AND o.group_id=$3`, [requestId, viewer.id, viewer.group_id])).rows[0];
     if (!request) throw new UserError('Эта просьба адресована другому участнику.');
-    // Every operation locks the occurrence first. Competing accept/completion/cancel calls serialize here.
+    // Template and occurrence locks serialize competing accept/completion/cancel calls.
     const task = await this.occurrence(viewer, request.occurrence_id, true);
     const won = (await this.db.query(`UPDATE help_requests SET state='accepted',accepted_by=$1 WHERE id=$2 AND state='pending' RETURNING id`, [viewer.id, requestId])).rows.length;
     if (!won || task.completed_at || task.assignee_id !== request.requester_id) throw new UserError('Просьба уже закрыта: задачу забрали, отменили или выполнили.');
@@ -227,16 +236,17 @@ export class Service {
     await this.event(id, viewer.id, 'help_cancelled');
   }
   async history(viewer: Member) {
+    this.assertMember(viewer);
     return (await this.db.query<{ title: string; kind: string; actor_id: number; created_at: Date; due_on: string }>(`SELECT t.title,e.kind,e.actor_id,e.created_at,o.due_on::text FROM events e
       JOIN occurrences o ON o.id=e.occurrence_id JOIN tasks t ON t.id=o.task_id
-      WHERE o.group_id=$1 AND e.created_at >= $2 ORDER BY e.id DESC LIMIT 20`, [viewer.group_id, new Date(this.now.getTime() - 7 * 86400_000)])).rows;
+      WHERE o.group_id=$1 AND e.created_at >= $2 AND o.group_id IN (SELECT id FROM task_groups WHERE bot_id=$3) ORDER BY e.id DESC LIMIT 20`, [viewer.group_id, new Date(this.now.getTime() - 7 * 86400_000),this.botId])).rows;
   }
   async reminders() {
-    const groups = (await this.db.query<{ id: number; timezone: string }>('SELECT id,timezone FROM task_groups ORDER BY id')).rows;
+    const groups = (await this.db.query<{ id: number; timezone: string }>('SELECT id,timezone FROM task_groups WHERE bot_id=$1 ORDER BY id',[this.botId])).rows;
     for (const group of groups) {
       await this.materialize(group.id);
       const day = localDay(this.now, group.timezone);
-      const members = (await this.db.query<Member>(`SELECT m.*,u.profile_name AS name FROM members m JOIN app_users u USING (telegram_id) WHERE group_id=$1`, [group.id])).rows;
+      const members = (await this.db.query<Member>(`SELECT m.*,u.profile_name AS name FROM members m JOIN app_users u USING (bot_id,telegram_id) WHERE group_id=$1 AND m.bot_id=$2`, [group.id,this.botId])).rows;
       for (const member of members) {
         const tasks = (await this.db.query<{ title: string; due_on: string; schedule: Schedule }>(`SELECT t.title,o.due_on::text,t.schedule FROM occurrences o JOIN tasks t ON t.id=o.task_id
           WHERE o.assignee_id=$1 AND o.completed_at IS NULL AND o.due_on<=$2 ORDER BY o.due_on,o.id`, [member.id, day])).rows

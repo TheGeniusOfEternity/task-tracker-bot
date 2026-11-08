@@ -4,18 +4,26 @@ import { getStore } from './db.js';
 import { processUpdate } from './bot.js';
 import { flushOutbox, telegramTransport } from './outbox.js';
 import type { Update } from 'grammy/types';
+import type { BotConfig } from './config.js';
+import { bindBot } from './registry.js';
 
-let botInfoPromise: Promise<UserFromGetMe> | undefined;
-export function token() {
-  if (!process.env.BOT_TOKEN) throw new Error('BOT_TOKEN is required');
-  return process.env.BOT_TOKEN;
+const botInfos = new Map<string,Promise<UserFromGetMe>>();
+export async function ensureBot(config: BotConfig) {
+  let promise = botInfos.get(config.token);
+  if (!promise) {
+    promise = new Api(config.token,{ timeoutSeconds: 8 }).getMe().catch(error => { botInfos.delete(config.token); throw error; });
+    botInfos.set(config.token,promise);
+  }
+  const info = await promise;
+  await bindBot(getStore(),config,info.id);
+  return info;
 }
-export async function handleUpdate(update: Update) {
-  const botToken = token();
-  botInfoPromise ??= new Api(botToken).getMe().catch(error => { botInfoPromise = undefined; throw error; });
+export async function handleUpdate(update: Update, config: BotConfig) {
   await processUpdate(getStore(), update, {
-    token: botToken, botInfo: await botInfoPromise,
-    adminIds: (process.env.ADMIN_TELEGRAM_IDS ?? '').split(',').map(s => s.trim()).filter(Boolean),
+    token: config.token, botInfo: await ensureBot(config), adminIds: config.adminIds,botId: config.id,
   });
 }
-export async function deliver() { return flushOutbox(getStore(), telegramTransport(token())); }
+export async function deliver(config: BotConfig, limit = 25, budgetMs = 18_000) {
+  await ensureBot(config);
+  return flushOutbox(getStore(),telegramTransport(config.token,Math.min(8000,budgetMs)),config.id,limit,budgetMs);
+}

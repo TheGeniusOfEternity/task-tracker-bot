@@ -5,7 +5,7 @@ import { Service, type Member, type Session } from './service.js';
 import { firstDue, localDay, ordinalNames, scheduleLabel, validDay, weekdayNames, type Schedule } from './schedule.js';
 import { UserError } from './security.js';
 
-export interface BotOptions { token: string; adminIds: string[]; botInfo: UserFromGetMe; now?: Date }
+export interface BotOptions { token: string; adminIds: string[]; botInfo: UserFromGetMe; now?: Date; botId?: string }
 const labels: Record<string, string> = { completed: '✅ Выполнено', reopened: '↩️ Снова открыто', transferred: '🤝 Передано', help_requested: '🙋 Запрошена помощь', help_cancelled: 'Просьба отменена' };
 const keyboard = (rows: { text: string; callback_data: string }[][]) => ({ inline_keyboard: rows });
 const button = (text: string, data: string) => ({ text, callback_data: data });
@@ -144,14 +144,15 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
   const chat = update.message?.chat ?? update.callback_query?.message?.chat;
   if (!from || chat?.type !== 'private') return;
   const uid = String(from.id);
+  const botId = options.botId ?? 'default';
   await store.transaction(async db => {
     // The upsert also locks this user's row, serializing their persistent wizard across serverless instances.
-    await db.query(`INSERT INTO app_users (telegram_id,profile_name) VALUES ($1,$2)
-      ON CONFLICT (telegram_id) DO UPDATE SET profile_name=excluded.profile_name`, [uid, [from.first_name, from.last_name].filter(Boolean).join(' ').slice(0, 128)]);
-    const fresh = await db.query('INSERT INTO processed_updates (update_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING update_id', [update.update_id]);
+    await db.query(`INSERT INTO app_users (telegram_id,profile_name,bot_id) VALUES ($1,$2,$3)
+      ON CONFLICT (bot_id,telegram_id) DO UPDATE SET profile_name=excluded.profile_name`, [uid, [from.first_name, from.last_name].filter(Boolean).join(' ').slice(0, 128),botId]);
+    const fresh = await db.query('INSERT INTO processed_updates (update_id,bot_id) VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING update_id', [update.update_id,botId]);
     if (!fresh.rows.length) return;
     await db.query('SAVEPOINT bot_action');
-    const s = new Service(db, `update:${update.update_id}`, options.now);
+    const s = new Service(db, `update:${update.update_id}`, options.now,botId);
     const bot = new Bot(options.token, { botInfo: options.botInfo });
     bot.command('id', async () => { await s.send(uid, `Твой Telegram ID: ${uid}`); });
     bot.command('start', async ctx => {
@@ -263,7 +264,7 @@ export async function processUpdate(store: Store, update: Update, options: BotOp
       const error = caught instanceof BotError ? caught.error : caught;
       if (!(error instanceof UserError)) throw error;
       await db.query('ROLLBACK TO SAVEPOINT bot_action');
-      const failed = new Service(db, `error:${update.update_id}`, options.now);
+      const failed = new Service(db, `error:${update.update_id}`, options.now,botId);
       if (update.callback_query) await failed.enqueue('answerCallbackQuery', { callback_query_id: update.callback_query.id, text: error.message.slice(0, 200), show_alert: true });
       else await failed.send(uid, error.message);
     }

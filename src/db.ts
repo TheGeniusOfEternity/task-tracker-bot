@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { attachDatabasePool } from '@vercel/functions';
+import { databaseUrl } from './config.js';
 
 export interface Database {
   query<T extends pg.QueryResultRow = pg.QueryResultRow>(sql: string, values?: unknown[]): Promise<{ rows: T[] }>;
@@ -9,9 +10,9 @@ export interface Store extends Database {
 }
 let pool: pg.Pool | undefined;
 export function getStore(): Store {
-  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
+  const connectionString = databaseUrl();
   if (!pool) {
-    pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 3,
+    pool = new pg.Pool({ connectionString, max: 3,
       connectionTimeoutMillis: 10_000, idleTimeoutMillis: 5_000 });
     attachDatabasePool(pool);
     pool.on('error', () => console.error('Database pool error'));

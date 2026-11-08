@@ -14,6 +14,8 @@ import webhook from '../api/webhook.js';
 import cron from '../api/cron.js';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import type { Update } from 'grammy/types';
+import { botConfigs, databaseUrl, findBot } from '../src/config.js';
+import { bindBot } from '../src/registry.js';
 
 const now = new Date('2026-11-08T16:00:00Z');
 const options = { token: '123456:fake-test-token', adminIds: ['101'], now,
@@ -25,6 +27,7 @@ let a: Member, b: Member, c: Member, outsider: Member;
 let sequence = 0;
 const run = <T>(fn: (s: Service) => Promise<T>) => store.transaction(db => fn(new Service(db, `test:${sequence++}`, now)));
 const runAt = <T>(day: string, fn: (s: Service) => Promise<T>) => store.transaction(db => fn(new Service(db, `day:${sequence++}`, new Date(`${day}T16:00:00Z`))));
+const runFor = <T>(botId: string, fn: (s: Service) => Promise<T>) => store.transaction(db => fn(new Service(db, `bot:${sequence++}`,now,botId)));
 const firstSaturday: Schedule = { kind: 'monthly_weekday', start: '2026-11-01', ordinal: 1, weekday: 6, overdue: 'weekends' };
 function adapter(db: { query: PGlite['query'] }): Database {
   return { async query<T extends QueryResultRow>(sql: string, values?: unknown[]) { return { rows: (await db.query(sql, values)).rows as T[] }; } };
@@ -32,7 +35,8 @@ function adapter(db: { query: PGlite['query'] }): Database {
 before(async () => {
   const sql = await readFile(new URL('../migrations/001_init.sql', import.meta.url), 'utf8')
     + '\n' + await readFile(new URL('../migrations/002_groups.sql', import.meta.url), 'utf8')
-    + '\n' + await readFile(new URL('../migrations/003_coalesced_occurrences.sql', import.meta.url), 'utf8');
+    + '\n' + await readFile(new URL('../migrations/003_coalesced_occurrences.sql', import.meta.url), 'utf8')
+    + '\n' + await readFile(new URL('../migrations/004_multiple_bots.sql', import.meta.url), 'utf8');
   if (process.env.TEST_DATABASE_URL) {
     pool = new pgDriver.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 5 });
     await pool.query(sql);
@@ -51,6 +55,8 @@ before(async () => {
 });
 beforeEach(async () => {
   await store.query('TRUNCATE app_users,task_groups,processed_updates RESTART IDENTITY CASCADE');
+  await store.query("DELETE FROM bots WHERE id<>'default'");
+  await store.query("UPDATE bots SET telegram_id=NULL WHERE id='default'");
   await run(async s => {
     for (const [uid, name] of [['101','Максим'],['102','Елена Иванова'],['103','Алексей'],['104','Чужой']]) {
       await s.db.query('INSERT INTO app_users (telegram_id,profile_name) VALUES ($1,$2)', [uid,name]);
@@ -63,6 +69,172 @@ beforeEach(async () => {
   });
 });
 after(async () => { await pg?.close(); await pool?.end(); });
+
+async function otherBot() {
+  await store.query("INSERT INTO bots (id,name) VALUES ('work','Рабочие задачи')");
+  for (const uid of ['101','102','103','105']) await store.query('INSERT INTO app_users (bot_id,telegram_id,profile_name) VALUES ($1,$2,$3)',['work',uid,`Work ${uid}`]);
+  const admin = await runFor('work',s => s.createGroup('101','Проект',['101']));
+  const code = await runFor('work',s => s.invite(admin));
+  await runFor('work',s => s.join('102',code));
+  const member = await runFor('work',s => s.requireMember('102'));
+  return { admin,member };
+}
+
+test('bot configuration supports old settings, secret references and Neon prefix', () => {
+  const env = { BOT_TOKEN: options.token,WEBHOOK_SECRET: 'a'.repeat(32),ADMIN_TELEGRAM_IDS: '101, 102' };
+  const single = botConfigs(env);
+  assert.equal(single[0]!.id,'default');
+  assert.deepEqual(single[0]!.adminIds,['101','102']);
+  const config = [
+    { id: 'default',name: 'Уборка',tokenEnv: 'BOT_TOKEN',webhookSecretEnv: 'WEBHOOK_SECRET' },
+    { id: 'work',name: 'Работа',tokenEnv: 'WORK_TOKEN',webhookSecretEnv: 'WORK_SECRET',adminIds: ['103'] },
+  ];
+  const multi = { ...env,WORK_TOKEN: '223456:fake-work-token',WORK_SECRET: 'b'.repeat(32),BOTS_JSON: JSON.stringify(config) };
+  const bots = botConfigs(multi);
+  assert.equal(bots.length,2); assert.deepEqual(bots[1]!.adminIds,['103']);
+  assert.equal(findBot('work',bots)?.token,multi.WORK_TOKEN);
+  assert.equal(findBot('unknown',bots),undefined);
+  assert.equal(findBot(['work'],bots),undefined);
+  assert.throws(() => botConfigs({ ...multi,WORK_TOKEN: options.token }),/own valid/);
+  assert.throws(() => botConfigs({ ...multi,WORK_SECRET: env.WEBHOOK_SECRET }),/different webhook secret/);
+  assert.throws(() => botConfigs({ ...multi,BOTS_JSON: JSON.stringify([config[0],config[0]]) }),/unique/);
+  assert.throws(() => botConfigs({ BOTS_JSON: 'bad json' }),/JSON array/);
+  assert.equal(databaseUrl({ DATABASE_POSTGRES_URL: 'integration-url' }),'integration-url');
+  assert.equal(databaseUrl({ DATABASE_URL: 'explicit',DATABASE_POSTGRES_URL: 'integration' }),'explicit');
+  assert.throws(() => databaseUrl({}),/DATABASE_URL/);
+});
+
+test('same Telegram users can belong to different bots with private names and groups', async () => {
+  const { admin,member } = await otherBot();
+  assert.equal(admin.telegram_id,a.telegram_id);
+  assert.notEqual(admin.id,a.id);
+  await run(s => s.alias(a,b.id,'Мама'));
+  await runFor('work',s => s.alias(admin,member.id,'Координатор'));
+  assert.equal(await run(s => s.name(a,b.id)),'Мама');
+  assert.equal(await runFor('work',s => s.name(admin,member.id)),'Координатор');
+  assert.equal((await runFor('work',s => s.members(admin))).length,2);
+  assert.equal((await run(s => s.members(a))).length,3);
+  await assert.rejects(runFor('work',s => s.alias(admin,b.id,'Другой')),UserError);
+  await assert.rejects(runFor('work',s => s.members(a)),UserError);
+  const code = await run(s => s.invite(a));
+  await assert.rejects(runFor('work',s => s.join('105',code)),/Код не найден/);
+});
+
+test('identical update IDs and persistent wizards are independent for each bot', async () => {
+  await otherBot();
+  await processUpdate(store,message(800,'/new'),options);
+  await processUpdate(store,message(800,'/group'),{ ...options,botId: 'work' });
+  await processUpdate(store,message(800,'/new'),{ ...options,botId: 'work' }); // Retried ID is ignored in work only.
+  assert.equal((await run(s => s.session('101')))?.step,'task_title');
+  assert.equal(await runFor('work',s => s.session('101')),undefined);
+  assert.equal((await store.query('SELECT bot_id FROM processed_updates WHERE update_id=800')).rows.length,2);
+  await processUpdate(store,message(801,'/new'),{ ...options,botId: 'work' });
+  await processUpdate(store,message(802,'Рабочая задача'),{ ...options,botId: 'work' });
+  assert.equal((await runFor('work',s => s.session('101')))?.step,'task_owner');
+  assert.equal((await run(s => s.session('101')))?.step,'task_title');
+  await processUpdate(store,callback(803,`rename:${b.id}`),{ ...options,botId: 'work' });
+  assert.equal((await store.query("SELECT payload FROM outbox WHERE bot_id='work' AND dedupe_key='error:803:0'")).rows[0]!.payload.show_alert,true);
+});
+
+test('task reads, help callbacks, completion and reminders stay within a bot', async () => {
+  const { admin,member } = await otherBot();
+  const t = await occurrence();
+  await runFor('work',s => s.createTask(admin,'Рабочая проверка',admin.id,{ kind: 'once',start: '2026-11-08' }));
+  const request = await run(s => s.requestHelp(a,t.id,[b.id]));
+  await assert.rejects(runFor('work',s => s.occurrence(admin,t.id)),UserError);
+  await assert.rejects(runFor('work',s => s.complete(admin,t.id)),UserError);
+  await assert.rejects(runFor('work',s => s.acceptHelp(member,request)),UserError);
+  await assert.rejects(runFor('work',s => s.materialize(a.group_id)),UserError);
+  await runFor('work',s => s.reminders());
+  const reminders = (await store.query("SELECT bot_id,payload FROM outbox WHERE dedupe_key LIKE 'reminder:%'")).rows;
+  assert.equal(reminders.length,1); assert.equal(reminders[0]!.bot_id,'work');
+  assert.match(reminders[0]!.payload.text,/Рабочая проверка/);
+  assert.equal(reminders[0]!.payload.text.includes('Проверить отчёт'),false);
+  assert.equal((await runFor('work',s => s.history(admin))).length,0);
+});
+
+test('outbox deduplication and sender selection are per bot', async () => {
+  await otherBot();
+  await store.query('DELETE FROM outbox');
+  await run(s => s.send('101','Уборка',undefined,'shared-key'));
+  await runFor('work',s => s.send('101','Работа',undefined,'shared-key'));
+  const first: string[] = [],second: string[] = [];
+  await flushOutbox(store,async (_method,payload) => { first.push(String(payload.text)); return {}; });
+  assert.deepEqual(first,['Уборка']);
+  assert.equal((await store.query("SELECT state FROM outbox WHERE bot_id='work'")).rows[0]!.state,'pending');
+  await flushOutbox(store,async (_method,payload) => { second.push(String(payload.text)); return {}; },'work');
+  assert.deepEqual(second,['Работа']);
+});
+
+test('database rejects mixed-bot memberships and registry prevents identity reuse', async () => {
+  const { admin } = await otherBot();
+  await assert.rejects(store.transaction(db => db.query(`INSERT INTO members (bot_id,group_id,telegram_id,role) VALUES ('work',$1,105,'member')`,[a.group_id])),/foreign key/i);
+  await bindBot(store,{ id: 'default',name: 'Уборка' },123456);
+  await bindBot(store,{ id: 'default',name: 'Переименованный' },123456);
+  await assert.rejects(bindBot(store,{ id: 'default',name: 'Другой' },223456),/identity changed/);
+  await assert.rejects(bindBot(store,{ id: 'work',name: 'Дубль' },123456),/unique|duplicate/i);
+  assert.equal((await store.query("SELECT name FROM bots WHERE id='default'")).rows[0]!.name,'Переименованный');
+  assert.equal((await runFor('work',s => s.requireMember('101'))).id,admin.id);
+});
+
+test('multiple-bot migration preserves legacy profiles, sessions, updates and pending delivery', async () => {
+  const legacy = new PGlite();
+  try {
+    for (const name of ['001_init.sql','002_groups.sql','003_coalesced_occurrences.sql']) {
+      await legacy.exec(await readFile(new URL(`../migrations/${name}`,import.meta.url),'utf8'));
+    }
+    await legacy.exec(`INSERT INTO app_users (telegram_id,profile_name) VALUES (201,'Админ'),(202,'Участник');
+      INSERT INTO task_groups (name) VALUES ('Проект');
+      INSERT INTO members (group_id,telegram_id,role) VALUES (1,201,'admin'),(1,202,'member');
+      INSERT INTO sessions (telegram_id,data) VALUES (201,'{"step":"task_title"}');
+      INSERT INTO processed_updates (update_id) VALUES (77);
+      INSERT INTO tasks (group_id,title,owner_id,schedule) VALUES (1,'Проверка',1,'{"kind":"once","start":"2026-11-08"}');
+      INSERT INTO occurrences (task_id,group_id,due_on,original_owner_id,assignee_id,coalesced) VALUES (1,1,'2026-11-08',1,1,true);
+      INSERT INTO help_requests (occurrence_id,requester_id) VALUES (1,1);
+      INSERT INTO help_recipients (request_id,member_id,message_id) VALUES (1,2,42);
+      INSERT INTO outbox (dedupe_key,method,payload,guard_help_id,recipient_id) VALUES ('legacy','sendMessage','{"chat_id":202,"text":"Помоги"}',1,2);`);
+    await legacy.exec(await readFile(new URL('../migrations/004_multiple_bots.sql',import.meta.url),'utf8'));
+    for (const table of ['app_users','members','task_groups','sessions','processed_updates','outbox']) {
+      const rows = (await legacy.query<{ bot_id: string }>(`SELECT bot_id FROM ${table}`)).rows;
+      assert.ok(rows.length); assert.ok(rows.every(row => row.bot_id === 'default'));
+    }
+    assert.equal((await legacy.query<{ step: string }>("SELECT data->>'step' AS step FROM sessions")).rows[0]!.step,'task_title');
+    assert.equal((await legacy.query<{ message_id: number }>('SELECT message_id FROM help_recipients')).rows[0]!.message_id,42);
+    await legacy.exec(`INSERT INTO bots (id,name) VALUES ('work','Работа');
+      INSERT INTO app_users (bot_id,telegram_id,profile_name) VALUES ('work',201,'Другой профиль');
+      INSERT INTO processed_updates (bot_id,update_id) VALUES ('work',77);
+      INSERT INTO sessions (bot_id,telegram_id,data) VALUES ('work',201,'{"step":"join"}');
+      INSERT INTO outbox (bot_id,dedupe_key,method,payload) VALUES ('work','legacy','sendMessage','{"chat_id":201,"text":"Работа"}');`);
+    assert.equal((await legacy.query('SELECT bot_id FROM processed_updates WHERE update_id=77')).rows.length,2);
+    assert.equal((await legacy.query('SELECT bot_id FROM sessions WHERE telegram_id=201')).rows.length,2);
+    assert.equal((await legacy.query("SELECT bot_id FROM outbox WHERE dedupe_key='legacy'")).rows.length,2);
+  } finally { await legacy.close(); }
+});
+
+test('webhook routing requires the selected bot secret and retains the legacy default URL', async () => {
+  const variables: NodeJS.ProcessEnv = {
+    BOT_TOKEN: options.token,WEBHOOK_SECRET: 'a'.repeat(32),WORK_BOT_TOKEN: '223456:work-test',WORK_WEBHOOK_SECRET: 'b'.repeat(32),
+    BOTS_JSON: JSON.stringify([
+      { id: 'default',name: 'Основной',tokenEnv: 'BOT_TOKEN',webhookSecretEnv: 'WEBHOOK_SECRET' },
+      { id: 'work',name: 'Рабочий',tokenEnv: 'WORK_BOT_TOKEN',webhookSecretEnv: 'WORK_WEBHOOK_SECRET' },
+    ]),
+  };
+  const saved = Object.fromEntries(Object.keys(variables).map(key => [key,process.env[key]]));
+  Object.assign(process.env,variables);
+  try {
+    for (const [bot,secret,expected] of [
+      ['work','a'.repeat(32),401],['work','b'.repeat(32),400],['default','a'.repeat(32),400],
+      [undefined,'a'.repeat(32),400],[['work'],'b'.repeat(32),401],['unknown','b'.repeat(32),401],
+    ] as const) {
+      let status = 0;
+      const response = { status(code: number) { status = code; return this; },end() {},json() {} };
+      await webhook({ method: 'POST',query: { bot },headers: { 'x-telegram-bot-api-secret-token': secret },body: {} } as unknown as VercelRequest,response as unknown as VercelResponse);
+      assert.equal(status,expected);
+    }
+  } finally {
+    for (const [key,value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+  }
+});
 
 async function occurrence(kind: 'once' | 'daily' = 'once') {
   await run(s => s.createTask(a, 'Проверить отчёт', a.id, { kind, start: '2026-11-08' }));
@@ -366,10 +538,16 @@ test('HTTP endpoints reject missing secrets and wrong methods before database ac
   assert.equal(matchesSecret('abc','abc'),false);
   assert.equal(matchesSecret('x'.repeat(32),'x'.repeat(32)),true);
   assert.equal(matchesSecret('y'.repeat(32),'x'.repeat(32)),false);
-  for (const [handler, method, expected] of [[webhook,'GET',405],[webhook,'POST',401],[cron,'GET',401],[cron,'POST',405]] as const) {
+  const oldToken = process.env.BOT_TOKEN, oldSecret = process.env.WEBHOOK_SECRET, oldConfigs = process.env.BOTS_JSON;
+  process.env.BOT_TOKEN = options.token; process.env.WEBHOOK_SECRET = 'x'.repeat(32); delete process.env.BOTS_JSON;
+  try { for (const [handler, method, expected] of [[webhook,'GET',405],[webhook,'POST',401],[cron,'GET',401],[cron,'POST',405]] as const) {
     let status = 0;
     const response = { setHeader() {}, status(code: number) { status = code; return this; }, end() {}, json() {} };
     await handler({ method, headers: {} } as VercelRequest,response as unknown as VercelResponse);
     assert.equal(status,expected);
+  } } finally {
+    for (const [name,value] of [['BOT_TOKEN',oldToken],['WEBHOOK_SECRET',oldSecret],['BOTS_JSON',oldConfigs]]) {
+      if (value === undefined) delete process.env[name!]; else process.env[name!] = value;
+    }
   }
 });

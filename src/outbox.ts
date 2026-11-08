@@ -9,25 +9,25 @@ export class TelegramError extends Error {
   constructor(readonly code: number, readonly retryAfter?: number) { super(`Telegram error ${code}`); }
 }
 export type Transport = (method: string, payload: Record<string, unknown>) => Promise<{ message_id?: number }>;
-export function telegramTransport(token: string): Transport {
+export function telegramTransport(token: string, timeoutMs = 8000): Transport {
   return async (method, payload) => {
     if (!['sendMessage', 'editMessageReplyMarkup', 'answerCallbackQuery'].includes(method)) throw new Error('Unsupported outbox method');
     const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(8000),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(timeoutMs),
     });
     const body = await response.json() as { ok: boolean; result: { message_id?: number }; error_code?: number; parameters?: { retry_after?: number } };
     if (!body.ok) throw new TelegramError(body.error_code ?? response.status, body.parameters?.retry_after);
     return typeof body.result === 'object' ? body.result : {};
   };
 }
-export async function flushOutbox(store: Store, transport: Transport, limit = 25) {
+export async function flushOutbox(store: Store, transport: Transport, botId = 'default', limit = 25, budgetMs = 18_000) {
   let sent = 0, failed = 0;
-  const deadline = Date.now() + 18_000;
+  const deadline = Date.now() + budgetMs;
   for (let i = 0; i < limit && Date.now() < deadline; i++) {
     const job = await store.transaction(async db => {
       const selected = (await db.query<Delivery>(`SELECT id,method,payload,attempts,guard_help_id,recipient_id FROM outbox
-        WHERE (state='pending' AND available_at<=now()) OR (state='sending' AND lease_until<now())
-        ORDER BY (method='answerCallbackQuery') DESC,id FOR UPDATE SKIP LOCKED LIMIT 1`)).rows[0];
+        WHERE bot_id=$1 AND ((state='pending' AND available_at<=now()) OR (state='sending' AND lease_until<now()))
+        ORDER BY (method='answerCallbackQuery') DESC,id FOR UPDATE SKIP LOCKED LIMIT 1`,[botId])).rows[0];
       if (!selected) return;
       if (selected.guard_help_id) {
         const state = (await db.query<{ state: string }>('SELECT state FROM help_requests WHERE id=$1', [selected.guard_help_id])).rows[0]?.state;
@@ -46,7 +46,7 @@ export async function flushOutbox(store: Store, transport: Transport, limit = 25
           await db.query('UPDATE help_recipients SET message_id=$1 WHERE request_id=$2 AND member_id=$3', [result.message_id, job.guard_help_id, job.recipient_id]);
           const state = (await db.query<{ state: string }>('SELECT state FROM help_requests WHERE id=$1', [job.guard_help_id])).rows[0]?.state;
           if (state !== 'pending') {
-            const s = new Service(db, `late-help:${job.id}`);
+            const s = new Service(db, `late-help:${job.id}`,undefined,botId);
             await s.enqueue('editMessageReplyMarkup', { chat_id: job.payload.chat_id, message_id: result.message_id, reply_markup: { inline_keyboard: [] } });
           }
         }
